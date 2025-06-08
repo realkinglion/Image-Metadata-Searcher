@@ -83,6 +83,9 @@ run_search_app_v5.bat（起動用）
 Step 3: セットアップスクリプトの作成
 install_v5.bat の内容：
 
+
+
+
 @echo off
 echo 画像メタ情報検索くん v5.1 Final セットアップ
 echo ==========================================
@@ -113,7 +116,11 @@ echo 今後は run_search_app_v5.bat で起動できます。
 echo ==========================================
 pause
 
+
+
+
 run_search_app_v5.bat の内容：
+
 
 @echo off
 title 画像メタ情報検索くん v5.1 Final
@@ -136,6 +143,10 @@ if %errorlevel% neq 0 (
     echo ==========================================
     pause
 )
+
+
+
+
 Step 4: 初回セットアップ
 
 install_v5.bat をダブルクリックして実行
