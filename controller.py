@@ -34,59 +34,85 @@ class ImageSearchController:
         self.view.set_controller(self)
         self.queue = queue.Queue(); self.observer = None
         self.sorted_search_history = []
+        self.current_matched_files = []
         self.current_matched_files_lock = threading.Lock()
+        self.search_cancel_event = threading.Event()
         self.view.root.after(100, self.process_queue)
 
-    def _search_thread(self, params):
-        """★★★ 修正: ThreadPoolExecutorを使いつつ、Modelのバッチ処理の恩恵を受けるように修正"""
+    def _get_all_files(self, directory, recursive):
         all_files = []
         try:
-            if params["recursive_search"]:
-                for root, _, files in os.walk(params["dir_path"]):
+            if recursive:
+                for root, _, files in os.walk(directory):
+                    if self.search_cancel_event.is_set(): return None
                     for file in files:
                         if os.path.splitext(file)[1].lower() in self.config.supported_formats:
                             all_files.append(os.path.join(root, file))
             else:
-                with os.scandir(params["dir_path"]) as it:
+                with os.scandir(directory) as it:
                     for entry in it:
+                        if self.search_cancel_event.is_set(): return None
                         if entry.is_file() and os.path.splitext(entry.name)[1].lower() in self.config.supported_formats:
                             all_files.append(entry.path)
+            return all_files
         except OSError as e:
-            logging.error(f"ディレクトリへのアクセスエラー: {params['dir_path']} -> {e}")
-            self.queue.put({"type": "error", "message": f"フォルダにアクセスできません: {e}"}); return
+            logging.error(f"ディレクトリへのアクセスエラー: {directory} -> {e}")
+            self.queue.put({"type": "error", "message": f"フォルダにアクセスできません: {e}"})
+            return None
+
+    def _search_thread(self, params):
+        self.search_cancel_event.clear()
+        self.queue.put({"type": "search_started"})
+        
+        all_files = self._get_all_files(params["dir_path"], params["recursive_search"])
+        if all_files is None: 
+            if not self.search_cancel_event.is_set():
+                self.queue.put({"type": "search_finished"})
+            return
 
         total_files = len(all_files)
         if total_files == 0:
-            self.queue.put({"type": "done", "matched_files": [], "params": params, "count": 0}); return
+            self.queue.put({"type": "done", "params": params})
+            return
+
+        if total_files > self.config.large_search_warning_threshold:
+            self.queue.put({"type": "confirm_large_search", "files": all_files, "params": params})
+            return
+
+        self._execute_search_tasks(all_files, params)
+
+    def _execute_search_tasks(self, all_files, params):
+        total_files = len(all_files)
         
-        matched_files = []
-        # ★★★ 修正: 以前の安定したThreadPoolExecutorの方式に戻し、呼び出す関数を新しいModelのメソッドに変更
         with ThreadPoolExecutor(max_workers=self.config.thread_pool_size) as executor:
-            future_to_file = {
-                executor.submit(self.model.get_metadata, f, not params["include_negative"]): f for f in all_files
-            }
+            future_to_file = {executor.submit(self.model.get_metadata_and_thumbnail, f): f for f in all_files}
             
             for i, future in enumerate(as_completed(future_to_file)):
-                file_path = future_to_file[future]
+                if self.search_cancel_event.is_set():
+                    for f in future_to_file: f.cancel()
+                    self.queue.put({"type": "search_cancelled"})
+                    return
+                
                 try:
-                    metadata = future.result()
+                    metadata, _, file_path = future.result()
                     if self.match_keyword(params["keyword"], params["match_type"], params["and_search"], metadata):
-                        matched_files.append(file_path)
+                        self.queue.put({"type": "result_found", "file_path": file_path})
                 except Exception as e:
-                    logging.error(f"ファイル処理中に例外発生: {file_path}", exc_info=True)
+                    logging.error(f"ファイル処理中に例外発生: {future_to_file[future]}", exc_info=True)
                 
                 self.queue.put({"type": "progress", "value": ((i + 1) / total_files) * 100})
-
-        self.queue.put({"type": "done", "matched_files": matched_files, "params": params, "count": len(matched_files)})
+        
+        self.queue.put({"type": "done", "params": params})
 
     def start_search(self, event=None):
         params = self.view.get_search_parameters()
-        if not params["dir_path"] or not os.path.isdir(params["dir_path"]):
-            messagebox.showerror("エラー", "検索対象フォルダを指定してください。"); return
-        if not params["keyword"]:
-            messagebox.showerror("エラー", "検索キーワードを入力してください。"); return
+        if not params["dir_path"] or not os.path.isdir(params["dir_path"]): messagebox.showerror("エラー", "検索対象フォルダを指定してください。"); return
+        if not params["keyword"]: messagebox.showerror("エラー", "検索キーワードを入力してください。"); return
         
+        with self.current_matched_files_lock:
+            self.current_matched_files.clear()
         self.view.current_page = 0
+        self.view.layout_results([], refresh=True)
         self.view.update_progress(0, "ファイルリスト作成中...")
         self.start_directory_watch(params["dir_path"])
         
@@ -97,40 +123,99 @@ class ImageSearchController:
             while True:
                 msg = self.queue.get_nowait()
                 msg_type = msg.get("type")
-                if msg_type == "progress": self.view.update_progress(msg["value"])
-                elif msg_type == "done":
-                    params = msg["params"]
-                    cache_key = (params["dir_path"], params["match_type"], params["keyword"], params["include_negative"], params["and_search"], params["recursive_search"])
-                    self.model.add_history(cache_key); self.update_history_display()
+                
+                if msg_type == "search_started":
+                    self.view.search_button.pack_forget(); self.view.cancel_button.pack(side=tk.LEFT, padx=5); self.view.cancel_button.config(state="normal")
+                
+                elif msg_type == "progress": self.view.update_progress(msg["value"])
+                
+                elif msg_type == "result_found":
                     with self.current_matched_files_lock:
-                        self.model.current_matched_files = msg["matched_files"]
-                    self.on_sort_changed()
-                    self.view.update_progress(0, text=f"{msg['count']} 件見つかりました")
+                        self.current_matched_files.append(msg["file_path"])
+                    if len(self.current_matched_files) <= self.config.max_display_items:
+                        self.on_sort_changed(refresh=False)
+                    else:
+                        # ページネーション情報のみ更新
+                        total_items = len(self.current_matched_files)
+                        max_items = self.view.max_display_var.get() or 1
+                        self.view.total_pages = (total_items + max_items - 1) // max_items
+                        self.view.page_info_label.config(text=f"ページ {self.view.current_page + 1}/{self.view.total_pages} ({total_items}件)")
+
+                elif msg_type == "done" or msg_type == "search_cancelled" or msg_type == "search_finished":
+                    self.view.cancel_button.pack_forget(); self.view.search_button.pack(side=tk.LEFT, padx=5)
+                    if msg_type == "done":
+                        params = msg.get("params")
+                        if params:
+                            cache_key = (params["dir_path"], params["match_type"], params["keyword"], params["include_negative"], params["and_search"], params["recursive_search"])
+                            self.model.add_history(cache_key); self.update_history_display()
+                        self.on_sort_changed()
+                        self.view.update_progress(100, text=f"{len(self.current_matched_files)} 件見つかりました")
+                    elif msg_type == "search_cancelled":
+                        self.view.update_progress(0, text="検索がキャンセルされました")
+
                 elif msg_type == "new_file_matched":
                     with self.current_matched_files_lock:
-                        if msg["file_path"] not in self.model.current_matched_files:
-                            self.model.current_matched_files.append(msg["file_path"])
+                        if msg["file_path"] not in self.current_matched_files:
+                            self.current_matched_files.append(msg["file_path"])
                     self.on_sort_changed(refresh=False)
+
                 elif msg_type == "error": messagebox.showerror("エラー", msg["message"])
+                
+                elif msg_type == "confirm_large_search":
+                    if messagebox.askokcancel("大規模検索の警告", f"{len(msg['files'])}件のファイルを検索します。\n処理に時間がかかる可能性があります。続行しますか？"):
+                         threading.Thread(target=self._execute_search_tasks, args=(msg['files'], msg['params']), daemon=True).start()
+                    else:
+                        self.queue.put({"type": "search_cancelled"})
+
         except queue.Empty: pass
         finally: self.view.root.after(100, self.process_queue)
-        
+    
     def on_sort_changed(self, event=None, refresh=True):
         with self.current_matched_files_lock:
-            sorted_files = self.model.apply_sort(list(self.model.current_matched_files), self.view.sort_var.get())
-        self.view.layout_results(sorted_files, refresh=refresh)
+            sorted_files = self.model.apply_sort(list(self.current_matched_files), self.view.sort_var.get())
+        
+        if self.config.enable_predictive_caching:
+            self._trigger_predictive_caching(sorted_files)
+        
+        files_with_thumbs = [(path, self.model._get_from_db(path).get('thumbnail') if self.model._get_from_db(path) else None) for path in sorted_files]
+        self.view.layout_results(files_with_thumbs, refresh=refresh)
+    
+    def _trigger_predictive_caching(self, sorted_files):
+        start_index = (self.view.current_page + 1) * self.config.max_display_items
+        end_index = start_index + (self.config.predictive_pages * self.config.max_display_items)
+        files_to_preload = sorted_files[start_index:end_index]
+
+        if files_to_preload:
+            threading.Thread(target=self._predictive_cache_task, args=(files_to_preload,), daemon=True).start()
+
+    def _predictive_cache_task(self, file_paths):
+        for file_path in file_paths:
+            _, cached_thumb, _ = self.model.get_metadata_and_thumbnail(file_path)
+            if cached_thumb: continue
+            future = self.view.thumbnail_executor.submit(self.view._create_and_get_webp, file_path, None)
+            future.add_done_callback(lambda f, p=file_path: self._on_predictive_cached(f, p))
+    
+    def _on_predictive_cached(self, future, file_path):
+        try:
+            _, webp_bytes = future.result()
+            if webp_bytes: self.model.cache_thumbnail(file_path, webp_bytes)
+        except Exception: pass
+
+    def cancel_search(self):
+        self.search_cancel_event.set()
+        self.view.cancel_button.config(state="disabled")
+        self.view.update_progress(self.view.progress['value'], "キャンセル中...")
         
     def on_closing(self):
-        if self.observer: self.observer.stop(); self.observer.join()
-        self.view.shutdown_executors()
+        self.cancel_search(); self.view.shutdown_executors()
         if self.view.root.winfo_exists(): self.config.window_geometry = self.view.root.geometry()
         self.config.save()
-        self.model.close()
-        self.view.root.destroy()
+        if self.observer: self.observer.stop(); self.observer.join()
+        self.model.close(); self.view.root.destroy()
         
     def match_keyword(self, keyword, match_type, is_and, text):
         if not text: return False
-        tokens = keyword.split()
+        tokens = keyword.split();
         if not tokens: return True
         text_lower = text.lower()
         if match_type == "exact": return keyword.lower() == text_lower
@@ -138,11 +223,9 @@ class ImageSearchController:
         else: return any(token.lower() in text_lower for token in tokens)
     
     def update_history_display(self):
-        history = self.model.load_history()
-        sort_option = self.view.history_sort_var.get()
+        history = self.model.load_history(); sort_option = self.view.history_sort_var.get()
         indexed_history = list(enumerate(history))
-        def get_sort_key(item, index, default=""):
-            return str(item[index]).lower() if isinstance(item, (list, tuple)) and len(item) > index else default
+        def get_sort_key(item, index, default=""): return str(item[index]).lower() if isinstance(item, (list, tuple)) and len(item) > index else default
         try:
             if sort_option == "ディレクトリ順": indexed_history.sort(key=lambda x: get_sort_key(x[1], 0))
             elif sort_option == "キーワード順": indexed_history.sort(key=lambda x: get_sort_key(x[1], 2))
@@ -175,20 +258,6 @@ class ImageSearchController:
     def browse_dest_directory(self):
         dir_path = filedialog.askdirectory(initialdir=self.view.dest_path_var.get());
         if dir_path: self.view.dest_path_var.set(dir_path)
-
-    def _file_operation(self, func, op_name):
-        dest = self.view.dest_path_var.get()
-        if not dest or not os.path.isdir(dest): messagebox.showerror("エラー", "有効な保存先フォルダを選択してください。"); return False
-        selected_list = self.view.get_selected_files()
-        if not selected_list: messagebox.showinfo("情報", f"{op_name}対象が選択されていません。"); return False
-        errors = []
-        for file_path in selected_list:
-            try:
-                if os.path.exists(file_path): func(file_path, dest)
-                else: errors.append(f"{os.path.basename(file_path)}: 見つかりません")
-            except Exception as e: errors.append(f"{os.path.basename(file_path)}: {e}")
-        if errors: messagebox.showerror("エラー", f"{op_name}中にエラーが発生しました:\n" + "\n".join(errors)); return False
-        return True
     
     def copy_selected_files(self):
         dest = self.view.dest_path_var.get()
@@ -198,6 +267,18 @@ class ImageSearchController:
 
     def move_selected_files(self):
         if self._file_operation(shutil.move, "移動"): self.start_search()
+
+    def _file_operation(self, func, op_name):
+        selected_list = self.view.get_selected_files()
+        if not selected_list: messagebox.showinfo("情報", f"{op_name}対象が選択されていません。"); return False
+        dest = self.view.dest_path_var.get(); errors = []
+        for file_path in selected_list:
+            try:
+                if os.path.exists(file_path): func(file_path, dest)
+                else: errors.append(f"{os.path.basename(file_path)}: 見つかりません")
+            except Exception as e: errors.append(f"{os.path.basename(file_path)}: {e}")
+        if errors: messagebox.showerror("エラー", f"{op_name}中にエラーが発生しました:\n" + "\n".join(errors)); return False
+        return True
 
     def copy_to_clipboard(self, text, data_type):
         try: self.view.root.clipboard_clear(); self.view.root.clipboard_append(text); messagebox.showinfo("情報", f"{data_type}をクリップボードにコピーしました。")
@@ -254,7 +335,7 @@ class ImageSearchController:
         else: messagebox.showerror("エラー", "指定のキャラクターネガティブが見つかりませんでした。")
 
     def show_full_image(self, file_path):
-        with self.current_matched_files_lock: sorted_files = self.model.apply_sort(list(self.model.current_matched_files), self.view.sort_var.get())
+        with self.current_matched_files_lock: sorted_files = self.model.apply_sort(list(self.current_matched_files), self.view.sort_var.get())
         try: ImageViewerWindow(self.view.root, self, sorted_files, sorted_files.index(file_path))
         except ValueError: messagebox.showerror("エラー", "ファイルがリストに見つかりません。")
             
@@ -302,10 +383,25 @@ class ImageSearchController:
         if not directory or not os.path.isdir(directory): messagebox.showerror("エラー", "有効なフォルダを指定してください。"); return
         count = self.view.novel_ai_count_var.get()
         if count <= 0: messagebox.showerror("エラー", "表示件数は1以上にしてください。"); return
+        self.view.update_progress(0, text="NovelAI画像を探しています...")
+        threading.Thread(target=self._show_novelai_thread, args=(directory, count), daemon=True).start()
+
+    def _show_novelai_thread(self, directory, count):
+        all_files = self._get_all_files(directory, True)
+        if all_files:
+            with ThreadPoolExecutor(max_workers=self.config.thread_pool_size) as executor:
+                # 戻り値は不要なので、単純に実行
+                list(executor.map(lambda f: self.model.get_metadata_and_thumbnail(f), all_files))
+        
         novel_ai_files = self.model.get_novelai_files_from_db(directory, count)
-        if not novel_ai_files: messagebox.showinfo("情報", "指定フォルダ内にNovelAI画像が見つかりませんでした。"); return
-        with self.current_matched_files_lock: self.model.current_matched_files = novel_ai_files
-        self.on_sort_changed()
+        if not novel_ai_files:
+            self.queue.put({"type": "error", "message": "指定フォルダ内にNovelAI画像が見つかりませんでした。"})
+            self.queue.put({"type": "search_finished"}) # ボタンを元に戻す
+            return
+        
+        with self.current_matched_files_lock:
+            self.current_matched_files = novel_ai_files
+        self.queue.put({"type": "done"})
 
     def start_directory_watch(self, directory):
         if self.observer: self.observer.stop(); self.observer.join()
@@ -326,6 +422,9 @@ class ImageSearchController:
             logging.warning(f"ファイルにアクセスできなかったためスキップ: {file_path}"); return
         
         params = self.view.get_search_parameters()
-        metadata = self.model.get_metadata(file_path, exclude_negative=not params["include_negative"])
+        metadata, _, _ = self.model.get_metadata_and_thumbnail(file_path)
         if self.match_keyword(params["keyword"], params["match_type"], params["and_search"], metadata):
             self.queue.put({"type": "new_file_matched", "file_path": file_path})
+    
+    def cache_thumbnail(self, file_path, webp_bytes):
+        self.model.cache_thumbnail(file_path, webp_bytes)

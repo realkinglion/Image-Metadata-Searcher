@@ -11,15 +11,11 @@ from config import AppConfig
 
 class ThreadSafeLRUCache:
     def __init__(self, capacity: int):
-        self.capacity = capacity
-        self.cache = collections.OrderedDict()
-        self._lock = threading.RLock()
-
+        self.capacity = capacity; self.cache = collections.OrderedDict(); self._lock = threading.RLock()
     def get(self, key, default=None):
         with self._lock:
             if key not in self.cache: return default
             self.cache.move_to_end(key); return self.cache[key]
-
     def set(self, key, value):
         with self._lock:
             if self.capacity <= 0: return
@@ -29,16 +25,13 @@ class ThreadSafeLRUCache:
 
 class ImageSearchModel:
     def __init__(self, config: AppConfig):
-        self.config = config
-        self.history_file = "search_history.json"
-        self.favorites_file = "favorites.json"
+        self.config = config; self.history_file = "search_history.json"; self.favorites_file = "favorites.json"
         self.memory_cache = ThreadSafeLRUCache(self.config.memory_cache_size)
-        self.db_path = "metadata_cache.db"
-        self.db_lock = threading.Lock()
+        self.db_path = "metadata_cache.db"; self.db_lock = threading.Lock()
         self.db_connection = None
         self._init_database()
         self.search_history = self.load_history()
-        self.current_matched_files = [] # ★★★ 修正: 属性を初期化
+        self.current_matched_files = []
 
     def _init_database(self):
         try:
@@ -46,59 +39,66 @@ class ImageSearchModel:
             self.db_connection.row_factory = sqlite3.Row
             with self.db_lock:
                 cursor = self.db_connection.cursor()
-                cursor.execute('PRAGMA journal_mode=WAL;')
-                cursor.execute('PRAGMA synchronous=NORMAL;')
+                cursor.execute('PRAGMA journal_mode=WAL;'); cursor.execute('PRAGMA synchronous=NORMAL;')
                 cursor.execute('''CREATE TABLE IF NOT EXISTS metadata_cache (
                                   file_path TEXT PRIMARY KEY, mtime REAL NOT NULL, meta TEXT,
-                                  meta_no_neg TEXT, width INTEGER, height INTEGER)''')
+                                  meta_no_neg TEXT, width INTEGER, height INTEGER,
+                                  thumbnail BLOB)''')
                 cursor.execute('CREATE INDEX IF NOT EXISTS idx_mtime ON metadata_cache(mtime)')
                 self.db_connection.commit()
         except sqlite3.Error as e:
             logging.error(f"データベース初期化失敗: {e}")
             if self.db_connection: self.db_connection.close()
     
-    def get_metadata(self, file_path, exclude_negative=True):
-        """★ 修正: 単一ファイル取得のメインロジック"""
-        try:
-            current_mtime = os.path.getmtime(file_path)
-        except FileNotFoundError: return ""
+    def get_metadata_and_thumbnail(self, file_path):
+        try: current_mtime = os.path.getmtime(file_path)
+        except FileNotFoundError: return "", None, file_path
 
-        cache_key = f"{file_path}:{exclude_negative}:{current_mtime}"
-        mem_cached = self.memory_cache.get(cache_key)
-        if mem_cached is not None:
-            return mem_cached
-
-        with self.db_lock:
-            cursor = self.db_connection.cursor()
-            cursor.execute("SELECT * FROM metadata_cache WHERE file_path = ?", (file_path,))
-            db_row = cursor.fetchone()
-
-        if db_row and db_row['mtime'] == current_mtime:
-            data_to_cache = db_row['meta_no_neg'] if exclude_negative else db_row['meta']
-            self.memory_cache.set(cache_key, data_to_cache)
-            return data_to_cache
+        db_data = self._get_from_db(file_path)
+        if db_data and db_data['mtime'] == current_mtime:
+            return db_data['meta_no_neg'], db_data.get('thumbnail'), file_path
 
         raw_meta = self._read_raw_metadata_from_disk(file_path)
         width, height = self._get_image_dimensions(file_path)
         meta_no_neg = self._filter_negative_prompt(raw_meta)
         
-        db_data = (file_path, current_mtime, raw_meta, meta_no_neg, width, height)
-        with self.db_lock:
-            cursor = self.db_connection.cursor()
-            cursor.execute("INSERT OR REPLACE INTO metadata_cache VALUES (?, ?, ?, ?, ?, ?)", db_data)
-            self.db_connection.commit()
-
-        data_to_cache = meta_no_neg if exclude_negative else raw_meta
-        self.memory_cache.set(cache_key, data_to_cache)
-        return data_to_cache
+        new_db_data = {'file_path': file_path, 'mtime': current_mtime, 'meta': raw_meta, 'meta_no_neg': meta_no_neg, 'width': width, 'height': height, 'thumbnail': None}
+        self._save_to_db(new_db_data)
         
+        return meta_no_neg, None, file_path
+
     def get_raw_metadata(self, file_path):
-        with self.db_lock:
-            cursor = self.db_connection.cursor()
-            cursor.execute("SELECT meta FROM metadata_cache WHERE file_path = ?", (file_path,))
-            row = cursor.fetchone()
-        if row and row['meta']: return row['meta']
+        db_data = self._get_from_db(file_path)
+        if db_data and db_data.get('meta') is not None: return db_data['meta']
         return self._read_raw_metadata_from_disk(file_path)
+
+    def _get_from_db(self, file_path):
+        with self.db_lock:
+            try:
+                cursor = self.db_connection.cursor()
+                cursor.execute("SELECT * FROM metadata_cache WHERE file_path = ?", (file_path,))
+                row = cursor.fetchone()
+                return dict(row) if row else None
+            except sqlite3.Error as e: logging.error(f"DB読込エラー: {file_path}, {e}"); return None
+
+    def _save_to_db(self, data):
+        with self.db_lock:
+            try:
+                cursor = self.db_connection.cursor()
+                cursor.execute("INSERT OR REPLACE INTO metadata_cache VALUES (?,?,?,?,?,?,?)",
+                               (data['file_path'], data['mtime'], data['meta'], data['meta_no_neg'],
+                                data['width'], data['height'], data.get('thumbnail')))
+                self.db_connection.commit()
+            except sqlite3.Error as e: logging.error(f"DB書込エラー: {data['file_path']}, {e}")
+    
+    def cache_thumbnail(self, file_path, thumbnail_bytes):
+        if not self.config.enable_thumbnail_caching: return
+        with self.db_lock:
+            try:
+                cursor = self.db_connection.cursor()
+                cursor.execute("UPDATE metadata_cache SET thumbnail = ? WHERE file_path = ?", (thumbnail_bytes, file_path))
+                self.db_connection.commit()
+            except sqlite3.Error as e: logging.error(f"サムネイルキャッシュ保存エラー: {file_path}, {e}")
 
     def _read_raw_metadata_from_disk(self, file_path):
         ext = os.path.splitext(file_path)[1].lower()
@@ -127,12 +127,8 @@ class ImageSearchModel:
         return " ".join(filter(None, text_parts)).strip()
     
     def get_resolution(self, file_path):
-        with self.db_lock:
-            cursor = self.db_connection.cursor()
-            cursor.execute("SELECT width, height FROM metadata_cache WHERE file_path = ?", (file_path,))
-            row = cursor.fetchone()
-        if row and row['width'] is not None and row['height'] is not None:
-            return row['width'] * row['height']
+        db_data = self._get_from_db(file_path)
+        if db_data and db_data.get('width') and db_data.get('height'): return db_data['width'] * db_data['height']
         w, h = self._get_image_dimensions(file_path)
         return w * h
 

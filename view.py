@@ -5,6 +5,7 @@ import sys
 import gc
 import logging
 import concurrent.futures
+import io
 try:
     from PIL import Image, ImageTk, ImageOps
 except ImportError:
@@ -19,10 +20,8 @@ except AttributeError:
 
 class ImageSearchView:
     def __init__(self, root, config: AppConfig):
-        self.root = root
-        self.config = config
-        self.controller = None
-        self.root.title("画像メタ情報検索くん v3.1 Final")
+        self.root = root; self.config = config; self.controller = None
+        self.root.title("画像メタ情報検索くん v5.1 Final")
         
         self.thumbnails = {}
         self.thumb_size = self.config.thumbnail_size
@@ -33,98 +32,107 @@ class ImageSearchView:
         self._resize_after_id = None
         self.thumbnail_executor = concurrent.futures.ThreadPoolExecutor(max_workers=self.config.thread_pool_size)
 
-        self.dir_path_var = tk.StringVar()
-        self.keyword_var = tk.StringVar()
-        self.match_type_var = tk.StringVar(value="partial")
-        self.and_search_var = tk.BooleanVar(value=True)
-        self.include_negative_var = tk.BooleanVar(value=False)
-        self.recursive_search_var = tk.BooleanVar(value=True)
-        self.history_var = tk.StringVar()
-        self.history_sort_var = tk.StringVar(value="追加順")
-        self.dest_path_var = tk.StringVar()
-        self.novel_ai_count_var = tk.IntVar(value=10)
+        # UI Variables
+        self.dir_path_var = tk.StringVar(); self.keyword_var = tk.StringVar()
+        self.match_type_var = tk.StringVar(value="partial"); self.and_search_var = tk.BooleanVar(value=True)
+        self.include_negative_var = tk.BooleanVar(value=False); self.recursive_search_var = tk.BooleanVar(value=True)
+        self.history_var = tk.StringVar(); self.history_sort_var = tk.StringVar(value="追加順")
+        self.dest_path_var = tk.StringVar(); self.novel_ai_count_var = tk.IntVar(value=10)
         self.sort_var = tk.StringVar(value="更新日時降順")
+        
+        # ★★★ ここに抜けていた行を追加しました ★★★
         self.max_display_var = tk.IntVar(value=self.config.max_display_items)
+        
         self.page_jump_var = tk.StringVar()
 
-    def set_controller(self, controller):
-        self.controller = controller
+    def set_controller(self, controller): self.controller = controller
+    def shutdown_executors(self): self.thumbnail_executor.shutdown(wait=False, cancel_futures=True)
 
-    def shutdown_executors(self):
-        self.thumbnail_executor.shutdown(wait=False, cancel_futures=True)
-
-    def _create_thumbnail_optimized(self, file_path):
+    def _create_and_get_webp(self, file_path, cached_thumb_bytes):
         try:
-            with Image.open(file_path) as img:
-                img = ImageOps.exif_transpose(img)
-                img.thumbnail(self.thumb_size, LANCZOS_RESAMPLING)
-                if img.mode != 'RGB': img = img.convert('RGB')
-                return ImageTk.PhotoImage(img)
+            img_to_process = None
+            if cached_thumb_bytes:
+                img_to_process = Image.open(io.BytesIO(cached_thumb_bytes))
+            else:
+                with Image.open(file_path) as img:
+                    img = ImageOps.exif_transpose(img)
+                    if max(img.size) > 2000:
+                        img.thumbnail((1000, 1000), LANCZOS_RESAMPLING)
+                    img.thumbnail(self.thumb_size, LANCZOS_RESAMPLING)
+                    if img.mode != 'RGB': img = img.convert('RGB')
+                    img_to_process = img.copy()
+            
+            webp_buffer = io.BytesIO()
+            img_to_process.save(webp_buffer, format="WEBP", quality=85)
+            webp_bytes_to_cache = webp_buffer.getvalue() if not cached_thumb_bytes else None
+            
+            return ImageTk.PhotoImage(img_to_process), webp_bytes_to_cache
         except Exception as e:
-            logging.error(f"サムネイル生成エラー: {file_path} -> {e}")
-            return None
+            logging.error(f"サムネイル生成/キャッシュエラー: {file_path} -> {e}")
+            return None, None
     
     def _update_thumbnail(self, future, file_path, label):
+        if not label.winfo_exists(): return
         try:
-            thumb = future.result()
-            if thumb:
-                self.thumbnails[file_path] = thumb
-                label.configure(image=thumb)
-        except (concurrent.futures.CancelledError):
-            pass # アプリ終了時などは無視
+            tk_thumb, webp_bytes = future.result()
+            if tk_thumb:
+                self.thumbnails[file_path] = tk_thumb
+                label.configure(image=tk_thumb)
+                if webp_bytes and self.config.enable_thumbnail_caching:
+                    self.controller.cache_thumbnail(file_path, webp_bytes)
+        except concurrent.futures.CancelledError: pass
         except Exception as e:
-            logging.error(f"サムネイル更新エラー: {file_path}, {e}")
-            label.configure(text="表示エラー")
+            if label.winfo_exists(): label.configure(text="表示エラー")
+            logging.error(f"サムネイルUI更新エラー: {file_path}, {e}")
 
     def _clear_offscreen_thumbnails(self, visible_files_set):
         if len(self.thumbnails) <= self.max_thumbnails: return
         to_delete = [path for path in self.thumbnails if path not in visible_files_set]
         for path in to_delete:
             del self.thumbnails[path]
-        gc.collect()
+        if to_delete: gc.collect()
 
-    def layout_results(self, files_to_display, refresh=True):
+    def layout_results(self, files_with_thumbs, refresh=True):
         for widget in self.results_inner_frame.winfo_children(): widget.destroy()
         if refresh: self.selected_files_vars.clear()
 
         max_items = self.max_display_var.get();
         if max_items <= 0: max_items = 1
-        total_items = len(files_to_display)
+        total_items = len(files_with_thumbs)
         self.total_pages = (total_items + max_items - 1) // max_items if total_items > 0 else 1
 
         if self.current_page >= self.total_pages: self.current_page = max(0, self.total_pages - 1)
         
-        self.page_info_label.config(text=f"ページ {self.current_page + 1}/{self.total_pages}")
+        self.page_info_label.config(text=f"ページ {self.current_page + 1}/{self.total_pages} ({total_items}件)")
         
         start_index, end_index = self.current_page * max_items, (self.current_page + 1) * max_items
-        page_files = files_to_display[start_index:end_index]
+        page_files_with_thumb_data = files_with_thumbs[start_index:end_index]
         
-        self._clear_offscreen_thumbnails(set(page_files))
+        self._clear_offscreen_thumbnails({path for path, _ in page_files_with_thumb_data})
 
-        if not page_files and refresh:
-            ttk.Label(self.results_inner_frame, text="見つかりませんでした…(>_<)").pack(padx=10, pady=10); return
+        if not page_files_with_thumb_data and refresh:
+            ttk.Label(self.results_inner_frame, text="見つかりませんでした…(>_<)").grid(padx=10, pady=10); return
 
         frame_width = self.results_frame.winfo_width(); cell_width = self.thumb_size[0] + 20
         col_count = max(1, frame_width // cell_width)
         
-        for i, file_path in enumerate(page_files):
+        for i, (file_path, cached_thumb_bytes) in enumerate(page_files_with_thumb_data):
             row_idx, col_idx = divmod(i, col_count)
             item_frame = ttk.Frame(self.results_inner_frame)
             item_frame.grid(row=row_idx, column=col_idx, padx=10, pady=10, sticky="n")
             
-            if file_path not in self.selected_files_vars:
-                self.selected_files_vars[file_path] = tk.BooleanVar(value=False)
+            if file_path not in self.selected_files_vars: self.selected_files_vars[file_path] = tk.BooleanVar(value=False)
             var = self.selected_files_vars[file_path]
             ttk.Checkbutton(item_frame, variable=var).pack(anchor=tk.W)
             
-            img_label = ttk.Label(item_frame, text="読込中...", cursor="hand2")
+            img_label = ttk.Label(item_frame, text="読込中...", cursor="hand2");
             img_label.pack()
 
             if file_path in self.thumbnails:
-                img_label.configure(image=self.thumbnails[file_path])
+                 img_label.configure(image=self.thumbnails[file_path])
             else:
-                future = self.thumbnail_executor.submit(self._create_thumbnail_optimized, file_path)
-                future.add_done_callback(lambda f, p=file_path, l=img_label: self._update_thumbnail(f, p, l))
+                future = self.thumbnail_executor.submit(self._create_and_get_webp, file_path, cached_thumb_bytes)
+                future.add_done_callback(lambda f, p=file_path, l=img_label: self.root.after_idle(self._update_thumbnail, f, p, l))
 
             img_label.bind("<Double-Button-1>", lambda e, p=file_path: self.controller.show_full_image(p))
             img_label.bind("<Button-3>", lambda e, p=file_path: self.show_context_menu(e, p))
@@ -160,9 +168,10 @@ class ImageSearchView:
         ttk.Checkbutton(options_frame, text="ネガティブ含む", variable=self.include_negative_var).grid(row=0, column=3, padx=5)
         ttk.Checkbutton(options_frame, text="サブフォルダも検索", variable=self.recursive_search_var).grid(row=0, column=4, padx=5)
         search_button_frame = ttk.Frame(search_settings_frame); search_button_frame.grid(row=5, column=0, columnspan=3, sticky="ew", pady=10)
-        tk.Button(search_button_frame, text="検索スタート", command=self.controller.start_search, bg="#007bff", fg="white", activebackground="#0056b3", activeforeground="white", font=("", 10, "bold"), relief="raised", bd=2, padx=10, pady=3).pack(side=tk.LEFT, padx=5)
+        self.search_button = tk.Button(search_button_frame, text="検索スタート", command=self.controller.start_search, bg="#007bff", fg="white", activebackground="#0056b3", activeforeground="white", font=("", 10, "bold"), relief="raised", bd=2, padx=10, pady=3); self.search_button.pack(side=tk.LEFT, padx=5)
+        self.cancel_button = tk.Button(search_button_frame, text="キャンセル", command=self.controller.cancel_search, state="disabled", bg="#6c757d", fg="white", font=("", 10, "bold"), relief="raised", bd=2, padx=10, pady=3)
         self.progress = ttk.Progressbar(search_button_frame, orient="horizontal", length=300, mode="determinate"); self.progress.pack(side=tk.LEFT, padx=5, fill=tk.X, expand=True)
-        self.progress_label = ttk.Label(search_button_frame, text="待機中..."); self.progress_label.pack(side=tk.LEFT, padx=5)
+        self.progress_label = ttk.Label(search_button_frame, text="待機中...", width=25, anchor="w"); self.progress_label.pack(side=tk.LEFT, padx=5)
         action_frame = ttk.Labelframe(top_controls_frame, text="機能"); action_frame.grid(row=0, column=1, padx=5, pady=5, sticky="nsew"); action_frame.columnconfigure(1, weight=1)
         ttk.Label(action_frame, text="検索履歴:").grid(row=0, column=0, padx=5, pady=5, sticky="w")
         self.history_combo = ttk.Combobox(action_frame, textvariable=self.history_var, state="readonly"); self.history_combo.grid(row=0, column=1, padx=5, pady=5, sticky="ew"); self.history_combo.bind("<<ComboboxSelected>>", self.controller.on_history_selected)
@@ -188,8 +197,8 @@ class ImageSearchView:
         ttk.Button(display_settings_frame, text="すべて選択", command=self.select_all_files).grid(row=4, column=0, sticky="ew", padx=5, pady=(10,2))
         ttk.Button(display_settings_frame, text="すべて解除", command=self.deselect_all_files).grid(row=5, column=0, sticky="ew", padx=5, pady=2)
         paging_frame = ttk.Frame(display_settings_frame); paging_frame.grid(row=6, column=0, sticky="ew", padx=5, pady=10)
-        ttk.Button(paging_frame, text="前", command=self.prev_page).pack(side=tk.LEFT, expand=True, fill=tk.X)
-        ttk.Button(paging_frame, text="次", command=self.next_page).pack(side=tk.LEFT, expand=True, fill=tk.X)
+        self.prev_page_btn = ttk.Button(paging_frame, text="前", command=self.prev_page); self.prev_page_btn.pack(side=tk.LEFT, expand=True, fill=tk.X)
+        self.next_page_btn = ttk.Button(paging_frame, text="次", command=self.next_page); self.next_page_btn.pack(side=tk.LEFT, expand=True, fill=tk.X)
         self.page_info_label = ttk.Label(display_settings_frame, text="ページ 1/1"); self.page_info_label.grid(row=7, column=0, pady=2)
         page_jump_frame = ttk.Frame(display_settings_frame); page_jump_frame.grid(row=8, column=0, sticky="ew", padx=5, pady=2)
         page_jump_entry = ttk.Entry(page_jump_frame, textvariable=self.page_jump_var, width=5); page_jump_entry.pack(side=tk.LEFT, padx=(0,5))
@@ -205,10 +214,9 @@ class ImageSearchView:
         self.progress["value"] = value
         if text: self.progress_label.config(text=text)
         elif 0 < value < 100: self.progress_label.config(text=f"検索中... {int(value)}%")
-        # 0や100の場合は完了メッセージが表示されるので、ここでは何もしない
+        elif value >= 100 and not text: self.progress_label.config(text="完了")
         elif value == 0 and not text: self.progress_label.config(text="待機中...")
-
-
+    
     def get_search_parameters(self): return { "dir_path": self.dir_path_var.get(), "keyword": self.keyword_var.get(), "match_type": self.match_type_var.get(), "and_search": self.and_search_var.get(), "include_negative": self.include_negative_var.get(), "recursive_search": self.recursive_search_var.get(), }
     def get_selected_files(self): return [f for f, var in self.selected_files_vars.items() if var.get()]
     def show_context_menu(self, event, file_path):
@@ -251,18 +259,18 @@ class ImageSearchView:
     def _on_mousewheel(self, event): self.canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
     def on_resize_frame(self, event):
         if self._resize_after_id: self.root.after_cancel(self._resize_after_id)
-        self._resize_after_id = self.root.after(300, lambda: self.controller.on_sort_changed(None, True))
+        self._resize_after_id = self.root.after(300, lambda: self.controller.on_sort_changed())
     def add_context_menu(self, widget):
         menu = tk.Menu(widget, tearoff=0); menu.add_command(label="切り取り", command=lambda: widget.event_generate("<<Cut>>")); menu.add_command(label="コピー", command=lambda: widget.event_generate("<<Copy>>")); menu.add_command(label="ペースト", command=lambda: widget.event_generate("<<Paste>>"))
         widget.bind("<Button-3>", lambda e: menu.tk_popup(e.x_root, e.y_root))
     def prev_page(self):
-        if self.current_page > 0: self.current_page -= 1; self.controller.on_sort_changed(None, True)
+        if self.current_page > 0: self.current_page -= 1; self.controller.on_sort_changed()
     def next_page(self):
-        if self.current_page < self.total_pages - 1: self.current_page += 1; self.controller.on_sort_changed(None, True)
+        if self.current_page < self.total_pages - 1: self.current_page += 1; self.controller.on_sort_changed()
     def jump_to_page(self):
         try:
             page_num = int(self.page_jump_var.get())
-            if 1 <= page_num <= self.total_pages: self.current_page = page_num - 1; self.controller.on_sort_changed(None, True)
+            if 1 <= page_num <= self.total_pages: self.current_page = page_num - 1; self.controller.on_sort_changed()
             else: messagebox.showerror("エラー", f"1から{self.total_pages}の間のページ番号を入力してください。")
         except ValueError: messagebox.showerror("エラー", "有効なページ番号（数値）を入力してください。")
         finally: self.page_jump_var.set("")
