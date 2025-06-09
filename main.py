@@ -29,8 +29,10 @@ def main():
         logging.critical("アプリケーションの起動中に致命的なエラーが発生しました。", exc_info=True)
         messagebox.showerror("致命的なエラー", f"アプリケーションの起動に失敗しました。\n\nエラー: {e}")
     finally:
-        if 'view' in locals() and view.root.winfo_exists():
-             config.window_geometry = view.root.geometry()
+        # 以下のウィンドウ情報保存処理は、controllerのon_closingで行われるため不要。
+        # 実行タイミングの問題でエラーの原因となるため削除。
+        # if 'view' in locals() and view.root.winfo_exists():
+        #      config.window_geometry = view.root.geometry()
         config.save()
         if model:
             model.close()
