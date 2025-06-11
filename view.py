@@ -12,6 +12,7 @@ except ImportError:
     raise
 
 from config import AppConfig
+from draggable_widgets import DraggableImageLabel, DroppableEntry
 
 try:
     LANCZOS_RESAMPLING = Image.Resampling.LANCZOS
@@ -21,7 +22,7 @@ except AttributeError:
 class ImageSearchView:
     def __init__(self, root, config: AppConfig):
         self.root = root; self.config = config; self.controller = None
-        self.root.title("画像メタ情報検索くん v5.1 Final")
+        self.root.title("画像メタ情報検索くん v5.2 DnD Final")
         
         self.thumbnails = {}
         self.thumb_size = self.config.thumbnail_size
@@ -32,17 +33,13 @@ class ImageSearchView:
         self._resize_after_id = None
         self.thumbnail_executor = concurrent.futures.ThreadPoolExecutor(max_workers=self.config.thread_pool_size)
 
-        # UI Variables
         self.dir_path_var = tk.StringVar(); self.keyword_var = tk.StringVar()
         self.match_type_var = tk.StringVar(value="partial"); self.and_search_var = tk.BooleanVar(value=True)
         self.include_negative_var = tk.BooleanVar(value=False); self.recursive_search_var = tk.BooleanVar(value=True)
         self.history_var = tk.StringVar(); self.history_sort_var = tk.StringVar(value="追加順")
         self.dest_path_var = tk.StringVar(); self.novel_ai_count_var = tk.IntVar(value=10)
         self.sort_var = tk.StringVar(value="更新日時降順")
-        
-        # ★★★ ここに抜けていた行を追加しました ★★★
         self.max_display_var = tk.IntVar(value=self.config.max_display_items)
-        
         self.page_jump_var = tk.StringVar()
 
     def set_controller(self, controller): self.controller = controller
@@ -65,7 +62,6 @@ class ImageSearchView:
             webp_buffer = io.BytesIO()
             img_to_process.save(webp_buffer, format="WEBP", quality=85)
             webp_bytes_to_cache = webp_buffer.getvalue() if not cached_thumb_bytes else None
-            
             return ImageTk.PhotoImage(img_to_process), webp_bytes_to_cache
         except Exception as e:
             logging.error(f"サムネイル生成/キャッシュエラー: {file_path} -> {e}")
@@ -78,12 +74,17 @@ class ImageSearchView:
             if tk_thumb:
                 self.thumbnails[file_path] = tk_thumb
                 label.configure(image=tk_thumb)
+                
+                if isinstance(label, DraggableImageLabel):
+                    label.current_photo_image = tk_thumb
+                
                 if webp_bytes and self.config.enable_thumbnail_caching:
                     self.controller.cache_thumbnail(file_path, webp_bytes)
-        except concurrent.futures.CancelledError: pass
+        except concurrent.futures.CancelledError: 
+            pass
         except Exception as e:
             if label.winfo_exists(): label.configure(text="表示エラー")
-            logging.error(f"サムネイルUI更新エラー: {file_path}, {e}")
+            logging.error(f"サムネイルUI更新エラー: {file_path}, {e}", exc_info=True)
 
     def _clear_offscreen_thumbnails(self, visible_files_set):
         if len(self.thumbnails) <= self.max_thumbnails: return
@@ -123,20 +124,28 @@ class ImageSearchView:
             
             if file_path not in self.selected_files_vars: self.selected_files_vars[file_path] = tk.BooleanVar(value=False)
             var = self.selected_files_vars[file_path]
-            ttk.Checkbutton(item_frame, variable=var).pack(anchor=tk.W)
             
-            img_label = ttk.Label(item_frame, text="読込中...", cursor="hand2");
+            ttk.Checkbutton(item_frame, variable=var, style="Large.TCheckbutton").pack(anchor=tk.W)
+            
+            img_label = DraggableImageLabel(
+                item_frame,
+                self.controller,
+                file_path,
+                text="読込中...",
+                cursor="hand2"
+            )
             img_label.pack()
 
             if file_path in self.thumbnails:
-                 img_label.configure(image=self.thumbnails[file_path])
+                 tk_thumb = self.thumbnails[file_path]
+                 img_label.configure(image=tk_thumb)
+                 img_label.current_photo_image = tk_thumb
             else:
                 future = self.thumbnail_executor.submit(self._create_and_get_webp, file_path, cached_thumb_bytes)
                 future.add_done_callback(lambda f, p=file_path, l=img_label: self.root.after_idle(self._update_thumbnail, f, p, l))
 
             img_label.bind("<Double-Button-1>", lambda e, p=file_path: self.controller.show_full_image(p))
             img_label.bind("<Button-3>", lambda e, p=file_path: self.show_context_menu(e, p))
-            img_label.bind("<Button-1>", lambda e, v=var: v.set(not v.get()))
             
             try: rel_path = os.path.relpath(file_path, self.dir_path_var.get())
             except ValueError: rel_path = os.path.basename(file_path)
@@ -147,11 +156,15 @@ class ImageSearchView:
         if refresh: self.canvas.yview_moveto(0)
 
     def create_widgets(self):
-        style = ttk.Style(); style.configure("TFrame", padding=5); style.configure("TLabel", padding=3)
+        style = ttk.Style()
+        style.configure("TFrame", padding=5); style.configure("TLabel", padding=3)
         style.configure("TButton", padding=3); style.configure("TLabelframe.Label", padding=3)
+        style.configure("Large.TCheckbutton", padding=3)
+
         self.root.rowconfigure(0, weight=1); self.root.columnconfigure(0, weight=1)
         main_frame = ttk.Frame(self.root, padding="10"); main_frame.grid(row=0, column=0, sticky="nsew")
-        main_frame.rowconfigure(1, weight=1); main_frame.columnconfigure(0, weight=1)
+        main_frame.rowconfigure(2, weight=1); main_frame.columnconfigure(0, weight=1)
+        
         top_controls_frame = ttk.Frame(main_frame); top_controls_frame.grid(row=0, column=0, sticky="ew")
         top_controls_frame.columnconfigure(1, weight=1)
         search_settings_frame = ttk.Labelframe(top_controls_frame, text="検索設定"); search_settings_frame.grid(row=0, column=0, padx=5, pady=5, sticky="ns")
@@ -181,7 +194,9 @@ class ImageSearchView:
         ttk.Button(action_frame, text="お気に入り設定保存", command=self.controller.save_favorite_settings).grid(row=1, column=2, padx=5, pady=5, sticky="w")
         file_op_frame = ttk.Labelframe(action_frame, text="選択したファイルを..."); file_op_frame.grid(row=2, column=0, columnspan=3, sticky="ew", padx=5, pady=5); file_op_frame.columnconfigure(1, weight=1)
         ttk.Label(file_op_frame, text="保存先フォルダ:").grid(row=0, column=0, padx=5, pady=5, sticky=tk.W)
-        dest_entry = ttk.Entry(file_op_frame, textvariable=self.dest_path_var); dest_entry.grid(row=0, column=1, padx=5, pady=5, sticky="ew"); self.add_context_menu(dest_entry)
+        dest_entry = DroppableEntry(file_op_frame, self.controller, textvariable=self.dest_path_var)
+        dest_entry.grid(row=0, column=1, padx=5, pady=5, sticky="ew")
+        self.add_context_menu(dest_entry)
         ttk.Button(file_op_frame, text="保存先選択", command=self.controller.browse_dest_directory).grid(row=0, column=2, padx=5, pady=5)
         ttk.Button(file_op_frame, text="コピー", command=self.controller.copy_selected_files).grid(row=0, column=3, padx=5, pady=5)
         ttk.Button(file_op_frame, text="移動", command=self.controller.move_selected_files).grid(row=0, column=4, padx=5, pady=5)
@@ -203,7 +218,14 @@ class ImageSearchView:
         page_jump_frame = ttk.Frame(display_settings_frame); page_jump_frame.grid(row=8, column=0, sticky="ew", padx=5, pady=2)
         page_jump_entry = ttk.Entry(page_jump_frame, textvariable=self.page_jump_var, width=5); page_jump_entry.pack(side=tk.LEFT, padx=(0,5))
         ttk.Button(page_jump_frame, text="ページ移動", command=self.jump_to_page).pack(side=tk.LEFT)
-        self.results_frame = ttk.Frame(main_frame, borderwidth=2, relief="sunken"); self.results_frame.grid(row=1, column=0, padx=5, pady=5, sticky="nsew"); self.results_frame.rowconfigure(0, weight=1); self.results_frame.columnconfigure(0, weight=1)
+        
+        hint_frame = ttk.Frame(main_frame)
+        hint_frame.grid(row=1, column=0, sticky="w", padx=5)
+        ttk.Label(hint_frame, text="（Ctrl+クリックで複数選択）", font=("", 8, "italic")).pack(side=tk.LEFT)
+
+        self.results_frame = ttk.Frame(main_frame, borderwidth=2, relief="sunken")
+        self.results_frame.grid(row=2, column=0, padx=5, pady=5, sticky="nsew")
+        self.results_frame.rowconfigure(0, weight=1); self.results_frame.columnconfigure(0, weight=1)
         self.canvas = tk.Canvas(self.results_frame); self.canvas.grid(row=0, column=0, sticky="nsew")
         self.scrollbar = ttk.Scrollbar(self.results_frame, orient="vertical", command=self.canvas.yview); self.scrollbar.grid(row=0, column=1, sticky="ns"); self.canvas.configure(yscrollcommand=self.scrollbar.set)
         self.results_inner_frame = ttk.Frame(self.canvas); self.canvas.create_window((0, 0), window=self.results_inner_frame, anchor="nw")

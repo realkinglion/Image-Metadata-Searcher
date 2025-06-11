@@ -22,6 +22,12 @@ class AppConfig:
     supported_formats: Tuple[str, ...] = field(default_factory=lambda: ('.jpg', '.jpeg', '.png', '.tiff', '.webp'))
     config_file: str = "app_config.json"
     
+    # ドラッグアンドドロップ設定
+    enable_drag_ghost: bool = True
+    # ★★★ 変更点: 透明度をより見やすい0.8に更新 ★★★
+    drag_ghost_opacity: float = 0.8
+    drag_threshold_pixels: int = 5
+    
     @classmethod
     def load(cls) -> 'AppConfig':
         config_path = cls().config_file

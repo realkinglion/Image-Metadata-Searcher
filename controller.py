@@ -16,6 +16,7 @@ from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
 
 from view import ImageSearchView, ImageViewerWindow
+from draggable_widgets import DropActionDialog, ProgressDialog
 from model import ImageSearchModel
 from config import AppConfig
 
@@ -38,6 +39,81 @@ class ImageSearchController:
         self.current_matched_files_lock = threading.Lock()
         self.search_cancel_event = threading.Event()
         self.view.root.after(100, self.process_queue)
+
+    def refresh_current_search(self):
+        """現在の検索条件で検索を再実行する"""
+        logging.info("検索結果を更新しています...")
+        self.on_sort_changed()
+
+    def handle_drop_to_folder(self, source_files, dest_folder):
+        """ファイルがフォルダにドロップされた時の処理"""
+        file_count = len(source_files)
+        display_files = [os.path.basename(f) for f in source_files[:3]]
+        if file_count > 3:
+            display_files.append(f"...他 {file_count - 3} 件")
+        
+        # ★★★ 変更点: 文字列の作成方法を互換性の高い形式に変更 ★★★
+        display_files_str = '\n'.join(display_files)
+        message = f"""{file_count}個のファイルを「{os.path.basename(dest_folder)}」へ:
+
+{display_files_str}
+
+どのように処理しますか？"""
+        
+        dialog = DropActionDialog(self.view.root, message)
+        action = dialog.result
+
+        if action == "cancel":
+            logging.info("ドロップ操作はキャンセルされました。")
+            return
+        
+        threading.Thread(
+            target=self._perform_file_operation_with_progress,
+            args=(source_files, dest_folder, action),
+            daemon=True
+        ).start()
+
+    def _perform_file_operation_with_progress(self, source_files, dest_folder, action):
+        """進捗ダイアログ付きでファイル操作を実行する内部メソッド"""
+        op_name = "コピー" if action == "copy" else "移動"
+        progress_dialog = ProgressDialog(self.view.root, f"ファイルを{op_name}中...", len(source_files))
+        
+        errors = []
+        try:
+            for i, file_path in enumerate(source_files):
+                try:
+                    if not os.path.exists(file_path):
+                        logging.warning(f"ファイルが見つかりません: {file_path}")
+                        continue
+                    
+                    if action == "move":
+                        shutil.move(file_path, dest_folder)
+                    elif action == "copy":
+                        shutil.copy2(file_path, dest_folder)
+                    
+                except Exception as e:
+                    logging.error(f"ファイル操作エラー ({file_path}): {e}")
+                    errors.append(f"{os.path.basename(file_path)}: {e}")
+                
+                self.view.root.after(0, progress_dialog.update, i + 1)
+        finally:
+            self.view.root.after(0, progress_dialog.close)
+
+        self.view.root.after(0, self._show_file_operation_result, len(source_files), op_name, errors, action)
+
+    def _show_file_operation_result(self, count, op_name, errors, action):
+        """ファイル操作の結果をメッセージボックスで表示"""
+        if errors:
+            error_message = f"{op_name}中に一部のファイルでエラーが発生しました:\n\n" + "\n".join(errors[:5])
+            messagebox.showerror("エラー", error_message)
+        else:
+            messagebox.showinfo("完了", f"{count}個のファイルを{op_name}しました。")
+        
+        if action == "move":
+            with self.current_matched_files_lock:
+                moved_files_set = set(self.view.get_selected_files())
+                self.current_matched_files = [f for f in self.current_matched_files if f not in moved_files_set]
+            self.refresh_current_search()
 
     def _get_all_files(self, directory, recursive):
         all_files = []
@@ -135,7 +211,6 @@ class ImageSearchController:
                     if len(self.current_matched_files) <= self.config.max_display_items:
                         self.on_sort_changed(refresh=False)
                     else:
-                        # ページネーション情報のみ更新
                         total_items = len(self.current_matched_files)
                         max_items = self.view.max_display_var.get() or 1
                         self.view.total_pages = (total_items + max_items - 1) // max_items
@@ -266,7 +341,12 @@ class ImageSearchController:
         if self._file_operation(shutil.copy2, "コピー") and messagebox.askyesno("完了", f"コピーが完了しました。\n保存先フォルダ「{os.path.basename(dest)}」を開きますか？"): self.open_folder(dest)
 
     def move_selected_files(self):
-        if self._file_operation(shutil.move, "移動"): self.start_search()
+        selected_files = self.view.get_selected_files()
+        if self._file_operation(shutil.move, "移動"):
+            with self.current_matched_files_lock:
+                moved_files_set = set(selected_files)
+                self.current_matched_files = [f for f in self.current_matched_files if f not in moved_files_set]
+            self.refresh_current_search()
 
     def _file_operation(self, func, op_name):
         selected_list = self.view.get_selected_files()
@@ -357,7 +437,7 @@ class ImageSearchController:
         new_name = simpledialog.askstring("名前変更", "新しいファイル名:", initialvalue=current_name)
         if new_name and new_name != current_name:
             new_path = os.path.join(os.path.dirname(file_path), new_name)
-            try: os.rename(file_path, new_path); messagebox.showinfo("完了", "ファイル名を変更しました。"); self.start_search()
+            try: os.rename(file_path, new_path); messagebox.showinfo("完了", "ファイル名を変更しました。"); self.refresh_current_search()
             except OSError as e: messagebox.showerror("エラー", f"名前変更失敗: {e}")
 
     def load_favorite_settings(self):
@@ -390,13 +470,12 @@ class ImageSearchController:
         all_files = self._get_all_files(directory, True)
         if all_files:
             with ThreadPoolExecutor(max_workers=self.config.thread_pool_size) as executor:
-                # 戻り値は不要なので、単純に実行
                 list(executor.map(lambda f: self.model.get_metadata_and_thumbnail(f), all_files))
         
         novel_ai_files = self.model.get_novelai_files_from_db(directory, count)
         if not novel_ai_files:
             self.queue.put({"type": "error", "message": "指定フォルダ内にNovelAI画像が見つかりませんでした。"})
-            self.queue.put({"type": "search_finished"}) # ボタンを元に戻す
+            self.queue.put({"type": "search_finished"}) 
             return
         
         with self.current_matched_files_lock:
