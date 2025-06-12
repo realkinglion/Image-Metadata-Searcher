@@ -1,5 +1,5 @@
 @echo off
-echo 画像メタ情報検索くん v5.1 Final セットアップ
+echo 画像メタ情報検索くん v5.2 DnD Final セットアップ
 echo ==========================================
 echo 必要なライブラリをインストールします...
 echo.
@@ -28,6 +28,9 @@ if %errorlevel% neq 0 (
     
     echo Watchdogをインストールしています...
     pip install watchdog>=2.1.0
+    
+    echo tkinterdnd2をインストールしています...
+    pip install tkinterdnd2>=0.3.0
 )
 
 echo.

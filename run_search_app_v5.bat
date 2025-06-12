@@ -1,6 +1,6 @@
 @echo off
-title 画像メタ情報検索くん v5.1 Final
-echo 画像メタ情報検索くん v5.1 Finalを起動しています...
+title 画像メタ情報検索くん v5.2 DnD Final
+echo 画像メタ情報検索くん v5.2 DnD Finalを起動しています...
 echo.
 
 python main.py
@@ -14,6 +14,7 @@ if %errorlevel% neq 0 (
     echo - Python または必要なライブラリが不足
     echo - install_v5.bat を実行していない
     echo - Python PATH設定の問題
+    echo - tkinterdnd2のインストール失敗
     echo.
     echo install_v5.bat を実行してください。
     echo ==========================================
