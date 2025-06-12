@@ -1,41 +1,41 @@
 @echo off
-echo ç”»åƒãƒ¡ã‚¿æƒ…å ±æ¤œç´¢ãã‚“ v5.2 DnD Final ã‚»ãƒƒãƒˆã‚¢ãƒƒãƒ—
+echo ‰æ‘œƒƒ^î•ñŒŸõ‚­‚ñ v5.2 DnD Final ƒZƒbƒgƒAƒbƒv
 echo ==========================================
-echo å¿…è¦ãªãƒ©ã‚¤ãƒ–ãƒ©ãƒªã‚’ã‚¤ãƒ³ã‚¹ãƒˆãƒ¼ãƒ«ã—ã¾ã™...
+echo •K—v‚Èƒ‰ƒCƒuƒ‰ƒŠ‚ğƒCƒ“ƒXƒg[ƒ‹‚µ‚Ü‚·...
 echo.
 
 pip install --upgrade pip
 
-echo requirements.txtã‹ã‚‰ä¾å­˜é–¢ä¿‚ã‚’ã‚¤ãƒ³ã‚¹ãƒˆãƒ¼ãƒ«ã—ã¦ã„ã¾ã™...
+echo requirements.txt‚©‚çˆË‘¶ŠÖŒW‚ğƒCƒ“ƒXƒg[ƒ‹‚µ‚Ä‚¢‚Ü‚·...
 pip install -r requirements.txt
 
 if %errorlevel% neq 0 (
     echo.
-    echo requirements.txtã§ã®ä¸€æ‹¬ã‚¤ãƒ³ã‚¹ãƒˆãƒ¼ãƒ«ã«å¤±æ•—ã—ã¾ã—ãŸã€‚
-    echo å€‹åˆ¥ã‚¤ãƒ³ã‚¹ãƒˆãƒ¼ãƒ«ã‚’è©¦è¡Œã—ã¾ã™...
+    echo requirements.txt‚Å‚ÌˆêŠ‡ƒCƒ“ƒXƒg[ƒ‹‚É¸”s‚µ‚Ü‚µ‚½B
+    echo ŒÂ•ÊƒCƒ“ƒXƒg[ƒ‹‚ğs‚µ‚Ü‚·...
     echo.
     
-    echo Pillow-SIMDã‚’ã‚¤ãƒ³ã‚¹ãƒˆãƒ¼ãƒ«ã—ã¦ã„ã¾ã™...
+    echo Pillow-SIMD‚ğƒCƒ“ƒXƒg[ƒ‹‚µ‚Ä‚¢‚Ü‚·...
     pip install Pillow-SIMD>=9.0.0
     if %errorlevel% neq 0 (
-        echo Pillow-SIMDã®ã‚¤ãƒ³ã‚¹ãƒˆãƒ¼ãƒ«ã«å¤±æ•—ã—ã¾ã—ãŸã€‚
-        echo é€šå¸¸ã®Pillowã‚’ã‚¤ãƒ³ã‚¹ãƒˆãƒ¼ãƒ«ã—ã¾ã™...
+        echo Pillow-SIMD‚ÌƒCƒ“ƒXƒg[ƒ‹‚É¸”s‚µ‚Ü‚µ‚½B
+        echo ’Êí‚ÌPillow‚ğƒCƒ“ƒXƒg[ƒ‹‚µ‚Ü‚·...
         pip install Pillow>=9.0.0
     )
     
-    echo ExifReadã‚’ã‚¤ãƒ³ã‚¹ãƒˆãƒ¼ãƒ«ã—ã¦ã„ã¾ã™...
+    echo ExifRead‚ğƒCƒ“ƒXƒg[ƒ‹‚µ‚Ä‚¢‚Ü‚·...
     pip install exifread>=3.0.0
     
-    echo Watchdogã‚’ã‚¤ãƒ³ã‚¹ãƒˆãƒ¼ãƒ«ã—ã¦ã„ã¾ã™...
+    echo Watchdog‚ğƒCƒ“ƒXƒg[ƒ‹‚µ‚Ä‚¢‚Ü‚·...
     pip install watchdog>=2.1.0
     
-    echo tkinterdnd2ã‚’ã‚¤ãƒ³ã‚¹ãƒˆãƒ¼ãƒ«ã—ã¦ã„ã¾ã™...
+    echo tkinterdnd2‚ğƒCƒ“ƒXƒg[ƒ‹‚µ‚Ä‚¢‚Ü‚·...
     pip install tkinterdnd2>=0.3.0
 )
 
 echo.
 echo ==========================================
-echo ã‚¤ãƒ³ã‚¹ãƒˆãƒ¼ãƒ«å®Œäº†ï¼
-echo ä»Šå¾Œã¯ run_search_app_v5.bat ã§èµ·å‹•ã§ãã¾ã™ã€‚
+echo ƒCƒ“ƒXƒg[ƒ‹Š®—¹I
+echo ¡Œã‚Í run_search_app_v5.bat ‚Å‹N“®‚Å‚«‚Ü‚·B
 echo ==========================================
 pause

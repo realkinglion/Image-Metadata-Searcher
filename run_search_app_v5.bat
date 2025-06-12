@@ -1,6 +1,6 @@
 @echo off
-title ç”»åƒãƒ¡ã‚¿æƒ…å ±æ¤œç´¢ãã‚“ v5.2 DnD Final
-echo ç”»åƒãƒ¡ã‚¿æƒ…å ±æ¤œç´¢ãã‚“ v5.2 DnD Finalã‚’èµ·å‹•ã—ã¦ã„ã¾ã™...
+title ‰æ‘œƒƒ^î•ñŒŸõ‚­‚ñ v5.2 DnD Final
+echo ‰æ‘œƒƒ^î•ñŒŸõ‚­‚ñ v5.2 DnD Final‚ð‹N“®‚µ‚Ä‚¢‚Ü‚·...
 echo.
 
 python main.py
@@ -8,15 +8,15 @@ python main.py
 if %errorlevel% neq 0 (
     echo.
     echo ==========================================
-    echo ã‚¨ãƒ©ãƒ¼ãŒç™ºç”Ÿã—ã¾ã—ãŸã€‚
+    echo ƒGƒ‰[‚ª”­¶‚µ‚Ü‚µ‚½B
     echo.
-    echo è€ƒãˆã‚‰ã‚Œã‚‹åŽŸå› ï¼š
-    echo - Python ã¾ãŸã¯å¿…è¦ãªãƒ©ã‚¤ãƒ–ãƒ©ãƒªãŒä¸è¶³
-    echo - install_v5.bat ã‚’å®Ÿè¡Œã—ã¦ã„ãªã„
-    echo - Python PATHè¨­å®šã®å•é¡Œ
-    echo - tkinterdnd2ã®ã‚¤ãƒ³ã‚¹ãƒˆãƒ¼ãƒ«å¤±æ•—
+    echo l‚¦‚ç‚ê‚éŒ´ˆöF
+    echo - Python ‚Ü‚½‚Í•K—v‚Èƒ‰ƒCƒuƒ‰ƒŠ‚ª•s‘«
+    echo - install_v5.bat ‚ðŽÀs‚µ‚Ä‚¢‚È‚¢
+    echo - Python PATHÝ’è‚Ì–â‘è
+    echo - tkinterdnd2‚ÌƒCƒ“ƒXƒg[ƒ‹Ž¸”s
     echo.
-    echo install_v5.bat ã‚’å®Ÿè¡Œã—ã¦ãã ã•ã„ã€‚
+    echo install_v5.bat ‚ðŽÀs‚µ‚Ä‚­‚¾‚³‚¢B
     echo ==========================================
     pause
 )
