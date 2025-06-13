@@ -55,62 +55,56 @@ class DragGhostWindow:
         text_label.pack()
         
     def move(self, x, y):
-        if self.window and self.window.winfo_exists(): self.window.geometry(f'+{x+15}+{y+15}')
+        if self.window and self.window.winfo_exists():
+            self.window.geometry(f'+{x+15}+{y+15}')
     def destroy(self):
-        if self.window and self.window.winfo_exists(): self.window.destroy(); self.window = None
+        if self.window and self.window.winfo_exists():
+            self.window.destroy()
+            self.window = None
 
+# ★★★★★ エラー修正：tkinterdnd2の標準的なイベント処理方法に全体を書き換え ★★★★★
 class DraggableImageLabel(ttk.Label):
     def __init__(self, parent, controller, file_path, **kwargs):
         super().__init__(parent, **kwargs)
         self.controller = controller
         self.file_path = file_path
         self.current_photo_image = None
-        self.start_x = 0
-        self.start_y = 0
-        self.is_dragging = False
         self.ghost_window = None
         
-        # dnd_start を使うので、DragInitCmdは不要になるが、念のため残す
+        # ドラッグソースとしてウィジェットを登録
         self.drag_source_register(DND_FILES)
+        
+        # ドラッグの開始と終了を検知するイベントに、ゴーストウィンドウの管理を紐付け
         self.dnd_bind('<<DragInitCmd>>', self.on_drag_init)
+        self.dnd_bind('<<DragMoveCmd>>', self.on_drag_move)
+        self.dnd_bind('<<DragEndCmd>>', self.on_drag_end)
 
-        self.bind("<ButtonPress-1>", self.on_button_press)
-        self.bind("<B1-Motion>", self.on_motion)
-        self.bind("<ButtonRelease-1>", self.on_button_release)
+        # 通常のクリックイベント
         self.bind("<Control-Button-1>", self.on_ctrl_click)
 
-    def on_button_press(self, event):
-        """マウスボタン押下時。イベント伝播を止めない。"""
-        self.start_x = event.x_root
-        self.start_y = event.y_root
-        self.is_dragging = False
+    def on_drag_init(self, event):
+        """ドラッグ開始時に呼び出される。ゴーストウィンドウを作成し、ドラッグするデータを準備する。"""
+        # ゴーストウィンドウを作成
+        self.create_ghost_window(event)
+        
+        # ドラッグするファイルリストを準備
+        selected_files = self.controller.view.get_selected_files()
+        files_to_drag = selected_files if self.file_path in selected_files else [self.file_path]
+        data = ' '.join([f'{{{os.path.abspath(p)}}}' for p in files_to_drag])
+        
+        # ライブラリにドラッグ操作の情報を返す
+        return (COPY, DND_FILES, data)
 
-    def on_motion(self, event):
-        """マウス移動時。ドラッグを開始するか、ゴーストを動かす。"""
-        if self.is_dragging:
-            if self.ghost_window:
-                self.ghost_window.move(event.x_root, event.y_root)
-            return
+    def on_drag_move(self, event):
+        """ドラッグ中に呼び出される。ゴーストウィンドウをマウスに追従させる。"""
+        if self.ghost_window:
+            self.ghost_window.move(event.x_root, event.y_root)
 
-        threshold = self.controller.config.drag_threshold_pixels
-        if (abs(event.x_root - self.start_x) > threshold or 
-            abs(event.y_root - self.start_y) > threshold):
-            self.is_dragging = True
-            
-            # ゴーストウィンドウを作成
-            self.create_ghost_window()
-            
-            # dnd_startでドラッグを即座に開始
-            tkinterdnd2.dnd_start(self, event)
-            
-            # dnd_startはブロッキングなので、終了後にクリーンアップ
-            self.cleanup_ghost_window()
-
-    def on_button_release(self, event):
-        """マウスボタン解放時。ドラッグでなければ何もしない。"""
+    def on_drag_end(self, event):
+        """ドラッグ終了時に呼び出される。ゴーストウィンドウを破棄する。"""
         self.cleanup_ghost_window()
 
-    def create_ghost_window(self):
+    def create_ghost_window(self, event):
         """ゴーストウィンドウを作成する。"""
         if self.ghost_window or not self.controller.config.enable_drag_ghost:
             return
@@ -127,20 +121,13 @@ class DraggableImageLabel(ttk.Label):
         )
         if self.ghost_window:
             # 最初の位置を即座に更新
-            self.ghost_window.move(self.start_x, self.start_y)
+            self.ghost_window.move(event.x_root, event.y_root)
 
     def cleanup_ghost_window(self):
         """ゴーストウィンドウをクリーンアップする。"""
         if self.ghost_window:
             self.ghost_window.destroy()
             self.ghost_window = None
-
-    def on_drag_init(self, event):
-        """dnd_startによって呼び出されるコールバック。"""
-        selected_files = self.controller.view.get_selected_files()
-        files_to_drag = selected_files if self.file_path in selected_files else [self.file_path]
-        data = ' '.join([f'{{{os.path.abspath(p)}}}' for p in files_to_drag])
-        return (COPY, DND_FILES, data)
 
     def on_ctrl_click(self, event):
         """Ctrl+クリックで選択状態を反転"""
@@ -153,41 +140,72 @@ class DraggableImageLabel(ttk.Label):
 class DroppableEntry(ttk.Entry):
     def __init__(self, parent, controller, **kwargs):
         super().__init__(parent, **kwargs)
-        self.controller = controller; self.drop_target_register(DND_FILES)
-        self.dnd_bind('<<Drop>>', self.on_drop); self.dnd_bind('<<DragEnter>>', self.on_drag_enter)
-        self.dnd_bind('<<DragLeave>>', self.on_drag_leave); self.normal_bg = self.cget('background')
-    def on_drag_enter(self, event): self.configure(background='lightblue'); return event.action
-    def on_drag_leave(self, event): self.configure(background=self.normal_bg)
+        self.controller = controller
+        self.drop_target_register(DND_FILES)
+        self.dnd_bind('<<Drop>>', self.on_drop)
+        self.dnd_bind('<<DragEnter>>', self.on_drag_enter)
+        self.dnd_bind('<<DragLeave>>', self.on_drag_leave)
+        self.normal_bg = self.cget('background')
+    def on_drag_enter(self, event):
+        self.configure(background='lightblue')
+        return event.action
+    def on_drag_leave(self, event):
+        self.configure(background=self.normal_bg)
     def on_drop(self, event):
-        self.configure(background=self.normal_bg); paths = self.tk.splitlist(event.data)
+        self.configure(background=self.normal_bg)
+        paths = self.winfo_toplevel().tk.splitlist(event.data)
         first_item = paths[0]
-        if os.path.isdir(first_item): self.controller.view.dest_path_var.set(first_item)
+        if os.path.isdir(first_item):
+            self.controller.view.dest_path_var.set(first_item)
         elif os.path.isfile(first_item):
             dest_folder = self.get()
-            if os.path.isdir(dest_folder): self.controller.handle_drop_to_folder(paths, dest_folder)
-            else: messagebox.showerror("エラー", "有効な保存先フォルダが指定されていません。")
+            if os.path.isdir(dest_folder):
+                self.controller.handle_drop_to_folder(paths, dest_folder)
+            else:
+                messagebox.showerror("エラー", "有効な保存先フォルダが指定されていません。")
         return event.action
+
 class DropActionDialog(tk.Toplevel):
     def __init__(self, parent, message):
         super().__init__(parent)
-        self.transient(parent); self.title("アクションの選択"); self.result = "cancel"
+        self.transient(parent)
+        self.title("アクションの選択")
+        self.result = "cancel"
         ttk.Label(self, text=message, justify=tk.LEFT, wraplength=350).pack(padx=20, pady=10)
-        btn_frame = ttk.Frame(self); btn_frame.pack(pady=10)
+        btn_frame = ttk.Frame(self)
+        btn_frame.pack(pady=10)
         ttk.Button(btn_frame, text="コピー", command=lambda: self.set_action("copy")).pack(side=tk.LEFT, padx=10)
         ttk.Button(btn_frame, text="移動", command=lambda: self.set_action("move")).pack(side=tk.LEFT, padx=10)
         ttk.Button(btn_frame, text="キャンセル", command=lambda: self.set_action("cancel")).pack(side=tk.LEFT, padx=10)
-        self.grab_set(); self.protocol("WM_DELETE_WINDOW", self.cancel)
-        self.geometry(f"+{parent.winfo_x()+50}+{parent.winfo_y()+50}"); self.wait_window(self)
-    def set_action(self, action): self.result = action; self.destroy()
-    def cancel(self): self.result = "cancel"; self.destroy()
+        self.grab_set()
+        self.protocol("WM_DELETE_WINDOW", self.cancel)
+        self.geometry(f"+{parent.winfo_x()+50}+{parent.winfo_y()+50}")
+        self.wait_window(self)
+    def set_action(self, action):
+        self.result = action
+        self.destroy()
+    def cancel(self):
+        self.result = "cancel"
+        self.destroy()
+
 class ProgressDialog(tk.Toplevel):
     def __init__(self, parent, title, max_value):
         super().__init__(parent)
-        self.transient(parent); self.title(title)
-        self.progress_var = tk.DoubleVar(); self.progressbar = ttk.Progressbar(self, variable=self.progress_var, maximum=max_value, length=300)
+        self.transient(parent)
+        self.title(title)
+        self.progress_var = tk.DoubleVar()
+        self.progressbar = ttk.Progressbar(self, variable=self.progress_var, maximum=max_value, length=300)
         self.progressbar.pack(padx=20, pady=10)
-        self.label_var = tk.StringVar(); self.label = ttk.Label(self, textvariable=self.label_var)
-        self.label.pack(pady=(0, 10)); self.max_value = max_value; self.update(0)
-        self.geometry(f"+{parent.winfo_x()+100}+{parent.winfo_y()+100}"); self.update_idletasks()
-    def update(self, current_value): self.progress_var.set(current_value); self.label_var.set(f"{current_value} / {self.max_value}"); self.update_idletasks()
-    def close(self): self.destroy()
+        self.label_var = tk.StringVar()
+        self.label = ttk.Label(self, textvariable=self.label_var)
+        self.label.pack(pady=(0, 10))
+        self.max_value = max_value
+        self.update(0)
+        self.geometry(f"+{parent.winfo_x()+100}+{parent.winfo_y()+100}")
+        self.update_idletasks()
+    def update(self, current_value):
+        self.progress_var.set(current_value)
+        self.label_var.set(f"{current_value} / {self.max_value}")
+        self.update_idletasks()
+    def close(self):
+        self.destroy()
