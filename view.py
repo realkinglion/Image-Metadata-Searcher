@@ -352,7 +352,7 @@ class ImageSearchView:
         self.root = root
         self.config = config
         self.controller = None
-        self.root.title("画像メタ情報検索くん v5.3 DnD Final")
+        self.root.title("画像メタ情報検索くん v5.4 ZIP対応版")
         
         self.thumbnails = {}
         self.thumb_size = (self.config.thumbnail_display_size, self.config.thumbnail_display_size)
@@ -845,7 +845,6 @@ class ImageSearchView:
         self.add_context_menu(dest_entry)
         ttk.Button(file_op_tab, text="選択", command=self.controller.browse_dest_directory).grid(row=0, column=2, padx=5, pady=5)
         
-        # ★★★★★ 機能追加：WebP変換ボタンを配置 ★★★★★
         ttk.Separator(file_op_tab, orient='horizontal').grid(row=1, column=0, columnspan=3, sticky='ew', pady=10)
         
         conversion_frame = ttk.Frame(file_op_tab)
@@ -860,6 +859,21 @@ class ImageSearchView:
         selected_convert_btn = ttk.Button(conversion_frame, text="選択中のPNGをWebPに変換", command=self.controller.convert_selected_to_webp)
         selected_convert_btn.grid(row=0, column=1, sticky='ew', padx=(2, 0))
         Tooltip(selected_convert_btn, "検索結果で選択されているPNGファイルのみをWebPに変換します。")
+        
+        # ★★★ ここからがZIP変換機能のUI ★★★
+        ttk.Separator(file_op_tab, orient='horizontal').grid(row=3, column=0, columnspan=3, sticky='ew', pady=5)
+        zip_frame = ttk.Frame(file_op_tab)
+        zip_frame.grid(row=4, column=0, columnspan=3, sticky='ew', padx=5)
+        zip_convert_btn = ttk.Button(
+            zip_frame, 
+            text="ZIP内の画像をWebPに変換...",
+            command=self.controller.convert_zip_to_webp
+        )
+        zip_convert_btn.pack(fill='x')
+        Tooltip(zip_convert_btn, 
+            "ZIPファイル内の画像を一括でWebP形式に変換し、新しいZIPファイルとして保存します。\n" +
+            "メタデータの保持やリサイズなどの詳細オプションも設定できます。"
+        )
 
         display_tab = ttk.Frame(notebook)
         notebook.add(display_tab, text='表示・ソート')
@@ -911,13 +925,16 @@ class ImageSearchView:
         page_jump_entry.pack(side=tk.LEFT, padx=(0,5))
         ttk.Button(page_jump_inner_frame, text="移動", command=self.jump_to_page).pack(side=tk.LEFT)
 
-        nai_tab = ttk.Frame(notebook)
-        notebook.add(nai_tab, text='NovelAI')
-        ttk.Label(nai_tab, text="最新NAI画像表示件数:").pack(side=tk.LEFT, padx=5, pady=5)
-        novel_ai_count_entry = ttk.Entry(nai_tab, textvariable=self.novel_ai_count_var, width=5)
-        novel_ai_count_entry.pack(side=tk.LEFT, padx=5, pady=5)
-        self.add_context_menu(novel_ai_count_entry)
-        ttk.Button(nai_tab, text="最新NovelAI画像表示", command=self.controller.show_novel_ai_images).pack(side=tk.LEFT, padx=5, pady=5)
+        latest_files_tab = ttk.Frame(notebook)
+        notebook.add(latest_files_tab, text='最新ファイル')
+        ttk.Label(latest_files_tab, text="最新ファイル表示件数:").pack(side=tk.LEFT, padx=5, pady=5)
+        latest_files_count_entry = ttk.Entry(latest_files_tab, textvariable=self.novel_ai_count_var, width=5)
+        latest_files_count_entry.pack(side=tk.LEFT, padx=5, pady=5)
+        self.add_context_menu(latest_files_count_entry)
+        
+        latest_files_btn = ttk.Button(latest_files_tab, text="最新更新ファイル表示", command=self.controller.show_latest_images)
+        latest_files_btn.pack(side=tk.LEFT, padx=5, pady=5)
+        Tooltip(latest_files_btn, "フォルダ内のファイルを更新日時順にスキャンし、最新のものを表示します。")
         
         self.setup_tooltips()
         self.setup_keyboard_navigation()
@@ -972,7 +989,7 @@ class ImageSearchView:
 
     def show_help(self, event=None):
         help_text = """
-画像メタ情報検索くん v5.2 - ヘルプ
+画像メタ情報検索くん v5.4 - ヘルプ
 
 【表示モード】
 - シンプル: 基本的な検索機能のみを表示します。
@@ -1240,3 +1257,96 @@ class ImageViewerWindow(tk.Toplevel):
         if self.resize_timer:
             self.after_cancel(self.resize_timer)
         self.resize_timer = self.after(300, self.fit_to_screen)
+
+# ★★★ ここからがZIP変換オプションのダイアログ ★★★
+class WebPConversionOptionsDialog(tk.Toplevel):
+    """WebP変換オプション設定ダイアログ"""
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.transient(parent)
+        self.title("WebP変換オプション")
+        self.result = None
+
+        self.lossless_var = tk.BooleanVar(value=True)
+        self.quality_var = tk.IntVar(value=95)
+        self.method_var = tk.IntVar(value=6)
+        self.preserve_metadata_var = tk.BooleanVar(value=True)
+        self.include_non_images_var = tk.BooleanVar(value=True)
+        self.keep_failed_var = tk.BooleanVar(value=True)
+        self.resize_var = tk.BooleanVar(value=False)
+        self.max_size_var = tk.IntVar(value=1920)
+
+        self.create_widgets()
+        self.geometry(f"+{parent.winfo_x()+50}+{parent.winfo_y()+50}")
+        self.grab_set()
+        self.wait_window(self)
+
+    def create_widgets(self):
+        quality_frame = ttk.LabelFrame(self, text="画質設定", padding=10)
+        quality_frame.pack(fill='x', padx=10, pady=5)
+        
+        lossless_cb = ttk.Checkbutton(quality_frame, text="ロスレス圧縮（最高品質）", variable=self.lossless_var, command=self.toggle_quality_settings)
+        lossless_cb.pack(anchor='w')
+
+        self.quality_controls_frame = ttk.Frame(quality_frame)
+        self.quality_controls_frame.pack(fill='x', pady=5, padx=20)
+        
+        ttk.Label(self.quality_controls_frame, text="品質:").pack(side='left')
+        self.quality_slider = ttk.Scale(self.quality_controls_frame, from_=1, to=100, variable=self.quality_var, orient='horizontal', length=200)
+        self.quality_slider.pack(side='left', padx=5, expand=True, fill='x')
+        self.quality_label = ttk.Label(self.quality_controls_frame, text="95", width=3)
+        self.quality_label.pack(side='left')
+        self.quality_var.trace('w', lambda *args: self.quality_label.config(text=str(self.quality_var.get())))
+
+        options_frame = ttk.LabelFrame(self, text="変換オプション", padding=10)
+        options_frame.pack(fill='x', padx=10, pady=5)
+        
+        ttk.Checkbutton(options_frame, text="メタデータを保持", variable=self.preserve_metadata_var).pack(anchor='w')
+        ttk.Checkbutton(options_frame, text="画像以外のファイルも含める", variable=self.include_non_images_var).pack(anchor='w')
+        ttk.Checkbutton(options_frame, text="変換失敗時は元ファイルを保持", variable=self.keep_failed_var).pack(anchor='w')
+        
+        resize_frame = ttk.Frame(options_frame)
+        resize_frame.pack(fill='x', pady=(10, 0))
+        
+        resize_cb = ttk.Checkbutton(resize_frame, text="最大サイズを制限:", variable=self.resize_var, command=self.toggle_resize_settings)
+        resize_cb.pack(side='left')
+        
+        self.size_entry = ttk.Entry(resize_frame, textvariable=self.max_size_var, width=6, state='disabled')
+        self.size_entry.pack(side='left', padx=5)
+        ttk.Label(resize_frame, text="px").pack(side='left')
+
+        button_frame = ttk.Frame(self)
+        button_frame.pack(fill='x', padx=10, pady=10)
+        
+        ttk.Button(button_frame, text="キャンセル", command=self.cancel_clicked).pack(side='right', padx=5)
+        ttk.Button(button_frame, text="変換開始", command=self.ok_clicked).pack(side='right')
+
+        self.toggle_quality_settings()
+
+    def toggle_quality_settings(self):
+        if self.lossless_var.get():
+            self.quality_slider.config(state='disabled')
+            self.quality_label.config(foreground='gray')
+        else:
+            self.quality_slider.config(state='normal')
+            self.quality_label.config(foreground='black')
+
+    def toggle_resize_settings(self):
+        state = 'normal' if self.resize_var.get() else 'disabled'
+        self.size_entry.config(state=state)
+
+    def ok_clicked(self):
+        self.result = {
+            'lossless': self.lossless_var.get(),
+            'quality': self.quality_var.get() if not self.lossless_var.get() else 100,
+            'method': self.method_var.get(),
+            'preserve_metadata': self.preserve_metadata_var.get(),
+            'include_non_images': self.include_non_images_var.get(),
+            'keep_failed_originals': self.keep_failed_var.get(),
+            'max_size': self.max_size_var.get() if self.resize_var.get() else None
+        }
+        self.destroy()
+
+    def cancel_clicked(self):
+        self.result = None
+        self.destroy()

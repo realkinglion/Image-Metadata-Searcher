@@ -267,14 +267,32 @@ class ImageSearchModel:
         return file_list
 
     def get_novelai_files_from_db(self, directory, limit):
+        """NovelAI画像をデータベースから検索（修正版）"""
         try:
             with self.db_lock:
                 cursor = self.db_connection.cursor()
-                query = '''SELECT file_path FROM metadata_cache WHERE file_path LIKE ? AND meta LIKE ? ORDER BY mtime DESC LIMIT ?'''
+                
+                # より厳密なNovelAI検索パターン
+                query = '''
+                    SELECT file_path, mtime FROM metadata_cache 
+                    WHERE file_path LIKE ? 
+                    AND (
+                        LOWER(meta) LIKE '%"software": "novelai"%' OR
+                        LOWER(meta) LIKE '%"application": "novelai"%' OR
+                        LOWER(meta) LIKE '%software=novelai%' OR
+                        LOWER(meta) LIKE '%created with novelai%'
+                    )
+                    ORDER BY mtime DESC 
+                    LIMIT ?
+                '''
+                
                 path_pattern = f"{os.path.normpath(directory)}%"
-                meta_pattern = '%NovelAI%'
-                cursor.execute(query, (path_pattern, meta_pattern, limit))
-                return [row['file_path'] for row in cursor.fetchall()]
+                cursor.execute(query, (path_pattern, limit))
+                results = cursor.fetchall()
+                
+                logging.info(f"NovelAI検索: {directory} で {len(results)} 件見つかりました")
+                return [row['file_path'] for row in results]
+                
         except sqlite3.Error as e:
             logging.error(f"NovelAI画像のDB検索エラー: {e}")
             return []
@@ -305,7 +323,6 @@ class ImageSearchModel:
             logging.error(f"メタデータからのキーワード候補取得エラー: {e}")
             return []
 
-    # ★★★★★ 機能改善：ロジックをModelに移動＆責務を明確化 ★★★★★
     def _extract_char_captions_from_meta(self, meta_text):
         """メタデータ文字列からキャラクタープロンプトのリストを抽出する"""
         json_str = self.extract_json_block(meta_text, '"v4_prompt"')
@@ -331,13 +348,11 @@ class ImageSearchModel:
         if exclude_keywords is None:
             exclude_keywords = set()
         else:
-            # 除外キーワードはカンマとスペースで分割し、小文字のセットに変換
             exclude_keywords = {kw.lower() for kw in re.split(r'[, ]+', exclude_keywords) if kw}
 
         tag_counter = collections.Counter()
         
         placeholders = ','.join('?' for _ in file_paths)
-        # ★★★★★ 機能改善：meta_no_negではなく、フルのmetaを取得 ★★★★★
         query = f"SELECT meta FROM metadata_cache WHERE file_path IN ({placeholders})"
 
         try:
@@ -348,10 +363,8 @@ class ImageSearchModel:
                     meta_text = row['meta']
                     if not meta_text: continue
                     
-                    # ★★★★★ 機能改善：キャラクタープロンプトからのみタグを抽出 ★★★★★
                     char_captions = self._extract_char_captions_from_meta(meta_text)
                     for caption in char_captions:
-                        # ★★★★★ 機能改善：カンマのみを区切り文字とする ★★★★★
                         tags = [tag.strip() for tag in caption.split(',') if tag.strip()]
                         valid_tags = [t for t in tags if t.lower() not in exclude_keywords and len(t) > 1]
                         tag_counter.update(valid_tags)

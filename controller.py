@@ -11,12 +11,16 @@ import logging
 import sys
 import subprocess
 import re
+import heapq
+import zipfile
+import io
+from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
 from PIL import Image
 
-from view import ImageSearchView, ImageViewerWindow
+from view import ImageSearchView, ImageViewerWindow, WebPConversionOptionsDialog
 from draggable_widgets import DropActionDialog, ProgressDialog
 from model import ImageSearchModel
 from config import AppConfig
@@ -174,7 +178,11 @@ class ImageSearchController:
                 
                 try:
                     metadata, _, file_path = future.result()
-                    if self.match_keyword(params["keyword"], params["match_type"], params["and_search"], metadata):
+                    text_to_search = metadata
+                    if params.get("include_negative"):
+                         text_to_search = self.model.get_raw_metadata(file_path)
+
+                    if self.match_keyword(params["keyword"], params["match_type"], params["and_search"], text_to_search):
                         self.queue.put({"type": "result_found", "file_path": file_path})
                 except Exception as e:
                     logging.error(f"ファイル処理中に例外発生: {future_to_file[future]}", exc_info=True)
@@ -212,7 +220,7 @@ class ImageSearchController:
                     self.view.display_smart_tags([])
                 
                 elif msg_type == "progress":
-                    self.view.update_progress(msg["value"])
+                    self.view.update_progress(msg.get("value", 0), text=msg.get("text", ""))
                 
                 elif msg_type == "result_found":
                     with self.current_matched_files_lock:
@@ -225,24 +233,37 @@ class ImageSearchController:
                         self.view.total_pages = (total_items + max_items - 1) // max_items
                         if self.view.page_info_label:
                             self.view.page_info_label.config(text=f"ページ {self.view.current_page + 1}/{self.view.total_pages} ({total_items}件)")
+                
+                elif msg_type == "display_specific_files":
+                    with self.current_matched_files_lock:
+                        self.current_matched_files = msg["files"]
+                    self.view.show_search_button()
+                    self.view.current_page = 0
+                    self.on_sort_changed()
+                    self.view.update_progress(100, text=f"{len(self.current_matched_files)} 件表示しました")
 
                 elif msg_type == "done" or msg_type == "search_cancelled" or msg_type == "search_finished":
                     self.view.show_search_button()
                     if msg_type == "done":
                         params = msg.get("params")
-                        if params:
+                        if params and params.get("keyword"):
                             cache_key = (params["dir_path"], params["match_type"], params["keyword"], params["include_negative"], params["and_search"], params["recursive_search"])
                             self.model.add_history(cache_key)
                             self.update_history_display()
                         self.on_sort_changed()
-                        self.view.update_progress(100, text=f"{len(self.current_matched_files)} 件見つかりました")
+                        if "text" not in msg:
+                            self.view.update_progress(100, text=f"{len(self.current_matched_files)} 件見つかりました")
 
-                        top_tags = self.model.get_top_tags_from_files(self.current_matched_files, params.get("keyword"))
-                        self.view.display_smart_tags(top_tags)
+                        if params and params.get("keyword"):
+                           top_tags = self.model.get_top_tags_from_files(self.current_matched_files, params.get("keyword"))
+                           self.view.display_smart_tags(top_tags)
 
                     elif msg_type == "search_cancelled":
                         self.view.update_progress(0, text="検索がキャンセルされました")
                         self.view.display_smart_tags([])
+                    
+                    elif msg_type == "search_finished":
+                         self.view.show_search_button()
 
                 elif msg_type == "new_file_matched":
                     with self.current_matched_files_lock:
@@ -470,7 +491,6 @@ class ImageSearchController:
         return self.model.get_char_captions(file_path)
         
     def get_char_negatives(self, file_path):
-        # この機能は現在使われていないが、将来のために残す
         meta_text = self.model.get_raw_metadata(file_path)
         json_str = self.model.extract_json_block(meta_text, '"v4_negative_prompt"')
         if json_str:
@@ -610,33 +630,85 @@ class ImageSearchController:
             self.view.keyword_var.set(meta_text)
             messagebox.showwarning("警告", "複雑なプロンプトは見つかりませんでした。メタ情報全体をキーワードに設定します。")
     
-    def show_novel_ai_images(self):
-        directory = self.view.dir_path_var.get()
-        if not directory or not os.path.isdir(directory):
-            messagebox.showerror("エラー", "有効なフォルダを指定してください。")
-            return
-        count = self.view.novel_ai_count_var.get()
-        if count <= 0:
-            messagebox.showerror("エラー", "表示件数は1以上にしてください。")
-            return
-        self.view.update_progress(0, text="NovelAI画像を探しています...")
-        threading.Thread(target=self._show_novelai_thread, args=(directory, count), daemon=True).start()
+    def show_latest_images(self):
+        """フォルダ内の画像ファイルを、純粋に更新日時順で最新のN件を表示する"""
+        try:
+            directory = self.view.dir_path_var.get()
+            if not directory or not os.path.isdir(directory):
+                messagebox.showerror("エラー", "検索対象フォルダを指定してください。")
+                return
+            
+            count = self.view.novel_ai_count_var.get()
+            if count <= 0:
+                messagebox.showerror("エラー", "表示件数は1以上にしてください。")
+                return
 
-    def _show_novelai_thread(self, directory, count):
-        all_files = self._get_all_files(directory, True)
-        if all_files:
-            with ThreadPoolExecutor(max_workers=self.config.thread_pool_size) as executor:
-                list(executor.map(lambda f: self.model.get_metadata_and_thumbnail(f), all_files))
-        
-        novel_ai_files = self.model.get_novelai_files_from_db(directory, count)
-        if not novel_ai_files:
-            self.queue.put({"type": "error", "message": "指定フォルダ内にNovelAI画像が見つかりませんでした。"})
-            self.queue.put({"type": "search_finished"}) 
-            return
-        
-        with self.current_matched_files_lock:
-            self.current_matched_files = novel_ai_files
-        self.queue.put({"type": "done"})
+            logging.info(f"最新ファイル検索開始: フォルダ={directory}, 上限={count}件")
+            
+            with self.current_matched_files_lock:
+                self.current_matched_files.clear()
+            self.view.layout_results([], refresh=True)
+            self.view.keyword_var.set(f"最新 {count} 件を表示")
+            self.queue.put({"type": "search_started"})
+            self.view.update_progress(0, "ファイルをスキャン中...")
+            
+            threading.Thread(target=self._latest_images_thread, args=(directory, count), daemon=True).start()
+            
+        except Exception as e:
+            error_msg = f"最新ファイル検索の開始に失敗しました: {e}"
+            logging.error(error_msg, exc_info=True)
+            messagebox.showerror("エラー", error_msg)
+
+    def _latest_images_thread(self, directory, count):
+        """
+        指定されたディレクトリ内の全画像ファイルをスキャンし、
+        更新日時が最新のN件を効率的に見つけ出す。
+        """
+        try:
+            self.search_cancel_event.clear()
+            
+            all_files = self._get_all_files(directory, self.view.recursive_search_var.get())
+            if all_files is None:
+                if not self.search_cancel_event.is_set():
+                    self.queue.put({"type": "search_finished"})
+                return
+            
+            total_files = len(all_files)
+            if total_files == 0:
+                self.queue.put({"type": "display_specific_files", "files": []})
+                return
+
+            top_files_heap = []
+
+            for i, file_path in enumerate(all_files):
+                if self.search_cancel_event.is_set():
+                    self.queue.put({"type": "search_cancelled"})
+                    return
+                
+                if (i + 1) % 100 == 0:
+                    progress = ((i + 1) / total_files) * 100
+                    self.queue.put({"type": "progress", "value": progress})
+                
+                try:
+                    mtime = os.path.getmtime(file_path)
+                    if len(top_files_heap) < count:
+                        heapq.heappush(top_files_heap, (mtime, file_path))
+                    elif mtime > top_files_heap[0][0]:
+                        heapq.heapreplace(top_files_heap, (mtime, file_path))
+                except FileNotFoundError:
+                    continue
+                except Exception as e:
+                    logging.warning(f"ファイル日時の取得に失敗: {file_path}, {e}")
+
+            top_files_heap.sort(key=lambda x: x[0], reverse=True)
+            final_files = [file_path for mtime, file_path in top_files_heap]
+            
+            self.queue.put({"type": "display_specific_files", "files": final_files})
+
+        except Exception as e:
+            logging.error(f"最新ファイル検索スレッドでエラー: {e}", exc_info=True)
+            self.queue.put({"type": "error", "message": f"検索中にエラーが発生しました: {e}"})
+            self.queue.put({"type": "search_finished"})
 
     def start_directory_watch(self, directory):
         if self.observer:
@@ -726,7 +798,6 @@ class ImageSearchController:
         self.view.keyword_var.set(new_keywords.strip(' ,') + ', ')
         self.start_search()
         
-    # ★★★★★ 機能追加：フォルダ内のPNGをWebPに一括変換する機能 ★★★★★
     def convert_folder_to_webp(self):
         source_dir = filedialog.askdirectory(title="WebPに変換したいPNG画像が含まれるフォルダを選択してください")
         if not source_dir:
@@ -742,7 +813,6 @@ class ImageSearchController:
         
         self._start_webp_conversion_thread(png_files)
 
-    # ★★★★★ 機能追加：選択中のPNGをWebPに変換する機能 ★★★★★
     def convert_selected_to_webp(self):
         selected_files = self.view.get_selected_files()
         png_files = [f for f in selected_files if f.lower().endswith('.png')]
@@ -790,3 +860,166 @@ class ImageSearchController:
         else:
             message = f"{success_count}件すべてのPNGファイルをWebPに変換しました。"
             self.view.root.after(0, messagebox.showinfo, "完了", message)
+
+    # ★★★ ここからがZIP変換機能 ★★★
+    def convert_zip_to_webp(self):
+        """ZIP内の画像をWebPに変換して新しいZIPとして保存"""
+        zip_path = filedialog.askopenfilename(
+            title="変換するZIPファイルを選択",
+            filetypes=[("ZIP files", "*.zip"), ("All files", "*.*")]
+        )
+        if not zip_path:
+            return
+
+        output_path = filedialog.asksaveasfilename(
+            title="変換後のZIPファイルの保存先",
+            defaultextension=".zip",
+            filetypes=[("ZIP files", "*.zip")],
+            initialfile=f"{Path(zip_path).stem}_webp.zip"
+        )
+        if not output_path:
+            return
+
+        options_dialog = WebPConversionOptionsDialog(self.view.root)
+        if not options_dialog.result:
+            return
+
+        options = options_dialog.result
+
+        threading.Thread(
+            target=self._perform_zip_webp_conversion,
+            args=(zip_path, output_path, options),
+            daemon=True
+        ).start()
+
+    def _perform_zip_webp_conversion(self, input_zip_path, output_zip_path, options):
+        """ZIP内画像のWebP変換を実行"""
+        errors = []
+        converted_count = 0
+        skipped_count = 0
+
+        try:
+            with zipfile.ZipFile(input_zip_path, 'r') as input_zip:
+                all_files = input_zip.namelist()
+                image_files = [f for f in all_files if self._is_convertible_image(f)]
+
+                if not image_files:
+                    self.view.root.after(0, messagebox.showinfo, "情報", "ZIPファイル内に変換可能な画像が見つかりませんでした。")
+                    return
+
+                progress_dialog = ProgressDialog(
+                    self.view.root, 
+                    f"ZIP内の画像をWebPに変換中...", 
+                    len(all_files)
+                )
+
+                with zipfile.ZipFile(output_zip_path, 'w', zipfile.ZIP_DEFLATED) as output_zip:
+                    processed = 0
+                    for file_name in all_files:
+                        processed += 1
+                        try:
+                            if self._is_convertible_image(file_name):
+                                file_data = input_zip.read(file_name)
+                                with Image.open(io.BytesIO(file_data)) as img:
+                                    base_name = Path(file_name).stem
+                                    dir_path = Path(file_name).parent
+                                    new_name = str(dir_path / f"{base_name}.webp")
+
+                                    output_buffer = io.BytesIO()
+                                    save_kwargs = {
+                                        'format': 'WEBP',
+                                        'lossless': options['lossless'],
+                                        'quality': options['quality'],
+                                        'method': options['method']
+                                    }
+                                    
+                                    if options['preserve_metadata']:
+                                        exif = img.info.get('exif')
+                                        if exif:
+                                            save_kwargs['exif'] = exif
+
+                                    if options.get('max_size'):
+                                        img.thumbnail(
+                                            (options['max_size'], options['max_size']), 
+                                             Image.Resampling.LANCZOS
+                                        )
+
+                                    img.save(output_buffer, **save_kwargs)
+                                    output_zip.writestr(new_name, output_buffer.getvalue())
+                                    converted_count += 1
+                            else:
+                                if options['include_non_images']:
+                                    file_data = input_zip.read(file_name)
+                                    output_zip.writestr(file_name, file_data)
+                                else:
+                                    skipped_count += 1
+                        except Exception as e:
+                            error_msg = f"{file_name}: {str(e)}"
+                            logging.error(f"ZIP内ファイル変換エラー: {error_msg}")
+                            errors.append(error_msg)
+                            if options['keep_failed_originals']:
+                                try:
+                                    file_data = input_zip.read(file_name)
+                                    output_zip.writestr(file_name, file_data)
+                                except: pass
+                        
+                        self.view.root.after(0, progress_dialog.update, processed)
+
+                self.view.root.after(0, progress_dialog.close)
+                self._show_zip_conversion_result(converted_count, skipped_count, errors, output_zip_path)
+        
+        except Exception as e:
+            error_msg = f"ZIP変換処理エラー: {str(e)}"
+            logging.error(error_msg, exc_info=True)
+            self.view.root.after(0, messagebox.showerror, "エラー", error_msg)
+            try:
+                if os.path.exists(output_zip_path):
+                    os.remove(output_zip_path)
+            except: pass
+
+    def _is_convertible_image(self, file_name):
+        """変換可能な画像ファイルかチェック"""
+        convertible_extensions = {'.png', '.jpg', '.jpeg', '.gif', '.bmp', '.tiff', '.tif'}
+        return Path(file_name).suffix.lower() in convertible_extensions
+
+    def _show_zip_conversion_result(self, converted_count, skipped_count, errors, output_path):
+        """ZIP変換結果を表示"""
+        message_parts = [f"変換完了: {converted_count} ファイル"]
+        if skipped_count > 0: message_parts.append(f"スキップ: {skipped_count} ファイル")
+        if errors: message_parts.append(f"エラー: {len(errors)} ファイル")
+
+        if os.path.exists(output_path):
+            output_size = os.path.getsize(output_path) / (1024 * 1024)
+            message_parts.append(f"\n出力ファイルサイズ: {output_size:.1f} MB")
+        
+        message = "\n".join(message_parts)
+        
+        if errors and messagebox.askyesno("変換完了", f"{message}\n\nエラーの詳細を表示しますか？"):
+            self._show_conversion_errors(errors)
+        else:
+            messagebox.showinfo("変換完了", message)
+
+    def _show_conversion_errors(self, errors):
+        """変換エラーの詳細を表示"""
+        error_window = tk.Toplevel(self.view.root)
+        error_window.title("変換エラーの詳細")
+        error_window.geometry("600x400")
+        
+        text_frame = ttk.Frame(error_window)
+        text_frame.pack(fill='both', expand=True, padx=10, pady=10)
+        
+        scrollbar = ttk.Scrollbar(text_frame)
+        scrollbar.pack(side='right', fill='y')
+        
+        text_widget = tk.Text(text_frame, wrap='word', yscrollcommand=scrollbar.set)
+        text_widget.pack(side='left', fill='both', expand=True)
+        scrollbar.config(command=text_widget.yview)
+        
+        error_text = "\n".join([f"• {error}" for error in errors[:100]])
+        if len(errors) > 100:
+            error_text += f"\n\n... 他 {len(errors) - 100} 件のエラー"
+            
+        text_widget.insert('end', error_text)
+        text_widget.config(state='disabled')
+        
+        ttk.Button(error_window, text="閉じる", command=error_window.destroy).pack(pady=5)
