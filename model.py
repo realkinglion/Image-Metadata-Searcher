@@ -272,7 +272,6 @@ class ImageSearchModel:
             with self.db_lock:
                 cursor = self.db_connection.cursor()
                 
-                # より厳密なNovelAI検索パターン
                 query = '''
                     SELECT file_path, mtime FROM metadata_cache 
                     WHERE file_path LIKE ? 
@@ -297,28 +296,38 @@ class ImageSearchModel:
             logging.error(f"NovelAI画像のDB検索エラー: {e}")
             return []
 
-    def get_suggestions_from_metadata(self, dir_path, prefix, limit=200, max_results=20):
+    # ★★★ 変更点: 新しい高速版サジェスト取得メソッド ★★★
+    def get_suggestions_from_metadata(self, dir_path, prefix, limit=50):
         if not dir_path or not prefix:
             return []
             
-        words = collections.Counter()
         try:
             with self.db_lock:
                 cursor = self.db_connection.cursor()
-                query = "SELECT meta_no_neg FROM metadata_cache WHERE file_path LIKE ? ORDER BY mtime DESC LIMIT ?"
-                path_pattern = f"{os.path.normpath(dir_path)}%"
-                cursor.execute(query, (path_pattern, limit))
                 
+                query = "SELECT meta_no_neg FROM metadata_cache WHERE file_path LIKE ? AND meta_no_neg LIKE ? ORDER BY mtime DESC LIMIT ?"
+                
+                path_pattern = f"{os.path.normpath(dir_path)}%"
+                meta_pattern = f"%{prefix}%"
+                
+                cursor.execute(query, (path_pattern, meta_pattern, limit))
+                
+                word_set = set()
+                # 正規表現をプリコンパイル
+                regex = re.compile(r'\b' + re.escape(prefix) + r'[\w-]*', re.IGNORECASE)
+
                 for row in cursor.fetchall():
                     meta_text = row['meta_no_neg']
                     if not meta_text: continue
-                    tokens = [t.strip("()[]") for t in re.split(r'[, ]+', meta_text.lower()) if t.strip("()[]")]
-                    words.update(tokens)
-
-            prefix_lower = prefix.lower()
-            suggestions = [word for word, count in words.most_common() if word.startswith(prefix_lower)]
-            
-            return suggestions[:max_results]
+                    
+                    tokens = regex.findall(meta_text)
+                    word_set.update(t.strip("()[]") for t in tokens)
+                    
+                    if len(word_set) >= 20:
+                        break
+                        
+                return sorted(list(word_set))[:20]
+                
         except sqlite3.Error as e:
             logging.error(f"メタデータからのキーワード候補取得エラー: {e}")
             return []

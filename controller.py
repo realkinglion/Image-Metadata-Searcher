@@ -46,6 +46,11 @@ class ImageSearchController:
         self.current_matched_files = []
         self.current_matched_files_lock = threading.Lock()
         self.search_cancel_event = threading.Event()
+        
+        # ★★★ 変更点: サジェスト用のキャッシュ変数を追加 ★★★
+        self._suggestion_history_cache = None
+        self._suggestion_cache_time = 0
+        
         self.view.root.after(100, self.process_queue)
 
     def refresh_current_search(self):
@@ -748,44 +753,60 @@ class ImageSearchController:
     def cache_thumbnail(self, file_path, webp_bytes):
         self.model.cache_thumbnail(file_path, webp_bytes)
 
+    # ★★★ 変更点: サジェスト取得のメインロジック ★★★
     def get_keyword_suggestions(self, current_text):
+        """高速化されたキーワードサジェスト取得"""
         parts = current_text.split(',')
         last_part = parts[-1].strip()
         words_in_last_part = last_part.split()
         prefix = words_in_last_part[-1] if words_in_last_part else ""
         
-        logging.debug(f"サジェスト検索 - 入力: '{current_text}', プレフィックス: '{prefix}'")
-        
-        if len(prefix) < 2:
+        if len(prefix) < self.config.suggestion_min_chars:
             return []
-            
-        history_keywords = set()
-        for item in self.model.load_history():
-            if isinstance(item, (list, tuple)) and len(item) > 2:
-                tokens = [t.strip() for t in re.split(r'[, ]+', item[2]) if t.strip()]
-                for token in tokens:
-                    if token.lower().startswith(prefix.lower()):
-                        history_keywords.add(token)
         
+        # 履歴キャッシュの更新（有効期限付き）
+        current_time = time.time()
+        if not self._suggestion_history_cache or current_time - self._suggestion_cache_time > self.config.suggestion_history_cache_ttl_sec:
+            self._suggestion_history_cache = self._build_history_keyword_cache()
+            self._suggestion_cache_time = current_time
+        
+        # 高速な履歴検索
+        history_suggestions = [
+            kw for kw in self._suggestion_history_cache 
+            if kw.lower().startswith(prefix.lower())
+        ]
+        
+        # データベース検索
         dir_path = self.view.dir_path_var.get()
-        metadata_keywords = []
+        db_suggestions = []
         if dir_path:
-            metadata_keywords = self.model.get_suggestions_from_metadata(dir_path, prefix)
+            db_suggestions = self.model.get_suggestions_from_metadata(dir_path, prefix, limit=self.config.suggestion_db_limit)
         
-        all_suggestions = list(history_keywords) + metadata_keywords
-        seen = set()
+        # 結果を結合して重複排除
+        all_suggestions = history_suggestions + db_suggestions
+        seen = {prefix.lower()}
         unique_suggestions = []
         for s in all_suggestions:
             s_lower = s.lower()
-            if s_lower not in seen and s_lower != prefix.lower():
+            if s_lower not in seen:
                 seen.add(s_lower)
                 unique_suggestions.append(s)
         
-        history_list_lower = {h.lower() for h in history_keywords}
-        unique_suggestions.sort(key=lambda x: (x.lower() not in history_list_lower, x.lower()))
-        
-        logging.debug(f"サジェスト結果: {unique_suggestions[:10]}")
-        return unique_suggestions[:10]
+        # 履歴に出てきたものを優先
+        history_set = set(s.lower() for s in history_suggestions)
+        unique_suggestions.sort(key=lambda x: (x.lower() not in history_set, x.lower()))
+
+        return unique_suggestions[:self.config.suggestion_max_results]
+
+    def _build_history_keyword_cache(self):
+        """履歴からキーワードのセットを構築"""
+        keywords = set()
+        for item in self.model.load_history():
+            if isinstance(item, (list, tuple)) and len(item) > 2:
+                # , と スペースの両方で分割
+                tokens = [t.strip() for t in re.split(r'[ ,]+', item[2]) if t.strip()]
+                keywords.update(tokens)
+        return list(keywords)
 
     def add_keyword_and_search(self, tag_to_add):
         """現在の検索キーワードにタグを追加して再検索する"""
@@ -844,7 +865,12 @@ class ImageSearchController:
                 webp_path = os.path.splitext(png_path)[0] + '.webp'
                 try:
                     with Image.open(png_path) as img:
-                        img.save(webp_path, format='WEBP', lossless=True, quality=100, **img.info)
+                        # EXIF情報を保持
+                        exif = img.info.get('exif')
+                        kwargs = {}
+                        if exif:
+                            kwargs['exif'] = exif
+                        img.save(webp_path, format='WEBP', lossless=True, quality=100, **kwargs)
                     success_count += 1
                 except Exception as e:
                     logging.error(f"WebP変換エラー ({os.path.basename(png_path)}): {e}")
@@ -861,7 +887,6 @@ class ImageSearchController:
             message = f"{success_count}件すべてのPNGファイルをWebPに変換しました。"
             self.view.root.after(0, messagebox.showinfo, "完了", message)
 
-    # ★★★ ここからがZIP変換機能 ★★★
     def convert_zip_to_webp(self):
         """ZIP内の画像をWebPに変換して新しいZIPとして保存"""
         zip_path = filedialog.askopenfilename(

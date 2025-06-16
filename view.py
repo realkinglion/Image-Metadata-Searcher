@@ -7,6 +7,8 @@ import logging
 import concurrent.futures
 import io
 import tkinterdnd2 as tkdnd
+import threading
+
 try:
     from PIL import Image, ImageTk, ImageOps
 except ImportError:
@@ -168,6 +170,11 @@ class SmartSearchBar(ttk.Frame):
         self.controller = controller
         self.view = view
         self._suggestion_click_pending = False
+        
+        # ★★★ 変更点: サジェスト機能用の変数を追加 ★★★
+        self._suggestion_timer = None
+        self._suggestion_cache = {}
+        self._suggestion_thread = None
 
         self.search_frame_container = ttk.Frame(self, style='Card.TFrame')
         self.search_frame_container.pack(fill='x', expand=True, padx=10, pady=(10, 0))
@@ -277,7 +284,11 @@ class SmartSearchBar(ttk.Frame):
             self.suggestion_listbox.selection_set(0)
             self.suggestion_listbox.activate(0)
 
+    # ★★★ 変更点: _on_key_releaseを全面的に書き換え ★★★
     def _on_key_release(self, event):
+        if not self.controller.config.enable_suggestions:
+            return
+
         if event.keysym in ("Up", "Down", "Left", "Right", "Return", "Escape", "Tab", "Shift_L", "Shift_R", "Control_L", "Control_R"):
             if event.keysym == "Escape":
                 self._hide_suggestions()
@@ -287,8 +298,48 @@ class SmartSearchBar(ttk.Frame):
         if hasattr(self.search_entry, 'is_placeholder_active') and self.search_entry.is_placeholder_active:
             return
             
-        suggestions = self.controller.get_keyword_suggestions(current_text)
-        self._update_suggestion_listbox(suggestions)
+        if self._suggestion_timer:
+            self.after_cancel(self._suggestion_timer)
+            
+        delay = self.controller.config.suggestion_delay_ms
+        self._suggestion_timer = self.after(delay, lambda: self._fetch_suggestions_async(current_text))
+
+    def _fetch_suggestions_async(self, text):
+        """非同期でサジェストを取得する"""
+        parts = text.split(',')
+        last_part = parts[-1].strip()
+        words_in_last_part = last_part.split()
+        prefix = words_in_last_part[-1] if words_in_last_part else ""
+        
+        min_chars = self.controller.config.suggestion_min_chars
+        if len(prefix) < min_chars:
+            self._hide_suggestions()
+            return
+            
+        if prefix in self._suggestion_cache:
+            self._update_suggestion_listbox(self._suggestion_cache[prefix])
+            return
+
+        if self._suggestion_thread and self._suggestion_thread.is_alive():
+            return
+            
+        self._suggestion_thread = threading.Thread(
+            target=self._fetch_suggestions_worker,
+            args=(text, prefix),
+            daemon=True
+        )
+        self._suggestion_thread.start()
+
+    def _fetch_suggestions_worker(self, text, prefix):
+        """ワーカースレッドで実際にサジェストを取得する"""
+        try:
+            suggestions = self.controller.get_keyword_suggestions(text)
+            self._suggestion_cache[prefix] = suggestions
+            
+            # UIスレッドで更新をスケジュールする
+            self.after_idle(lambda: self._update_suggestion_listbox(suggestions))
+        except Exception as e:
+            logging.error(f"サジェスト取得ワーカースレッドでエラー: {e}")
 
     def _apply_selected_suggestion(self):
         if not self.suggestion_listbox or not self.suggestion_listbox.curselection():
@@ -352,7 +403,7 @@ class ImageSearchView:
         self.root = root
         self.config = config
         self.controller = None
-        self.root.title("画像メタ情報検索くん v5.4 ZIP対応版")
+        self.root.title("画像メタ情報検索くん v5.5 高速サジェスト版")
         
         self.thumbnails = {}
         self.thumb_size = (self.config.thumbnail_display_size, self.config.thumbnail_display_size)
@@ -860,7 +911,6 @@ class ImageSearchView:
         selected_convert_btn.grid(row=0, column=1, sticky='ew', padx=(2, 0))
         Tooltip(selected_convert_btn, "検索結果で選択されているPNGファイルのみをWebPに変換します。")
         
-        # ★★★ ここからがZIP変換機能のUI ★★★
         ttk.Separator(file_op_tab, orient='horizontal').grid(row=3, column=0, columnspan=3, sticky='ew', pady=5)
         zip_frame = ttk.Frame(file_op_tab)
         zip_frame.grid(row=4, column=0, columnspan=3, sticky='ew', padx=5)
@@ -989,7 +1039,7 @@ class ImageSearchView:
 
     def show_help(self, event=None):
         help_text = """
-画像メタ情報検索くん v5.4 - ヘルプ
+画像メタ情報検索くん v5.5 - ヘルプ
 
 【表示モード】
 - シンプル: 基本的な検索機能のみを表示します。
@@ -1258,7 +1308,6 @@ class ImageViewerWindow(tk.Toplevel):
             self.after_cancel(self.resize_timer)
         self.resize_timer = self.after(300, self.fit_to_screen)
 
-# ★★★ ここからがZIP変換オプションのダイアログ ★★★
 class WebPConversionOptionsDialog(tk.Toplevel):
     """WebP変換オプション設定ダイアログ"""
     def __init__(self, parent):
@@ -1322,6 +1371,7 @@ class WebPConversionOptionsDialog(tk.Toplevel):
         ttk.Button(button_frame, text="変換開始", command=self.ok_clicked).pack(side='right')
 
         self.toggle_quality_settings()
+        self.toggle_resize_settings()
 
     def toggle_quality_settings(self):
         if self.lossless_var.get():
